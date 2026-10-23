@@ -1,0 +1,87 @@
+{
+  "cases": [
+    {
+      "name": "cached_plane_hit",
+      "upstream_ref": "source/SMLib/src/SmRayTracer.cpp:1711 AddSurfaceToGrid followed by FireRay",
+      "inputs": {
+        "surfaces": [{"kind":"plane","o":[0,0,0],"x":[1,0,0],"y":[0,1,0],"scale":[1,1],"domain":[0,0,4,4]}],
+        "grid": {"bbox":[-1,-1,-1,5,5,5],"size":[4,4,4],"ray_tol":1e-5,"ray_acc":1e-8},
+        "ops": [
+          {"op":"add_surface","surface":0},
+          {"op":"fire","p":[2,2,1],"v":[0,0,-1],"max_t":2,"hit_any":false,"skip":null}
+        ]
+      }
+    },
+    {
+      "name": "cached_plane_max_t_miss",
+      "upstream_ref": "source/SMLib/src/SmRayTracer.cpp:1711 AddSurfaceToGrid; FireRay maximum-parameter control",
+      "inputs": {
+        "surfaces": [{"kind":"plane","o":[0,0,0],"x":[1,0,0],"y":[0,1,0],"scale":[1,1],"domain":[0,0,4,4]}],
+        "grid": {"bbox":[-1,-1,-1,5,5,5],"size":[4,4,4],"ray_tol":1e-5,"ray_acc":1e-8},
+        "ops": [
+          {"op":"add_surface","surface":0},
+          {"op":"fire","p":[2,2,1],"v":[0,0,-1],"max_t":0.5,"hit_any":false,"skip":null}
+        ]
+      }
+    },
+    {
+      "name": "plane_without_insertion_miss",
+      "upstream_ref": "source/SMLib/src/SmRayTracer.cpp:1332 FireRay; no-insertion control for cached_plane_hit",
+      "inputs": {
+        "surfaces": [{"kind":"plane","o":[0,0,0],"x":[1,0,0],"y":[0,1,0],"scale":[1,1],"domain":[0,0,4,4]}],
+        "grid": {"bbox":[-1,-1,-1,5,5,5],"size":[4,4,4],"ray_tol":1e-5,"ray_acc":1e-8},
+        "ops": [{"op":"fire","p":[2,2,1],"v":[0,0,-1],"max_t":2,"hit_any":false,"skip":null}]
+      }
+    },
+    {
+      "name": "cached_bilinear_hit",
+      "upstream_ref": "source/SMLib/src/SmRayTracer.cpp:1711 AddSurfaceToGrid; bilinear z=u*v cache leaves",
+      "inputs": {
+        "surfaces": [{"kind":"bezier","p":1,"q":1,"net":[[[0,0,0,1],[0,4,0,1]],[[4,0,0,1],[4,4,1,1]]]}],
+        "grid": {"bbox":[-1,-1,-1,5,5,5],"size":[4,4,4],"ray_tol":1e-5,"ray_acc":1e-8},
+        "ops": [
+          {"op":"add_surface","surface":0},
+          {"op":"fire","p":[2,2,1],"v":[0,0,-1],"max_t":2,"hit_any":false,"skip":null}
+        ]
+      }
+    },
+    {
+      "name": "cached_bilinear_max_t_miss",
+      "upstream_ref": "source/SMLib/src/SmRayTracer.cpp:1711 AddSurfaceToGrid; bilinear maximum-parameter control",
+      "inputs": {
+        "surfaces": [{"kind":"bezier","p":1,"q":1,"net":[[[0,0,0,1],[0,4,0,1]],[[4,0,0,1],[4,4,1,1]]]}],
+        "grid": {"bbox":[-1,-1,-1,5,5,5],"size":[4,4,4],"ray_tol":1e-5,"ray_acc":1e-8},
+        "ops": [
+          {"op":"add_surface","surface":0},
+          {"op":"fire","p":[2,2,1],"v":[0,0,-1],"max_t":0.5,"hit_any":false,"skip":null}
+        ]
+      }
+    },
+    {
+      "name": "bilinear_without_insertion_miss",
+      "upstream_ref": "source/SMLib/src/SmRayTracer.cpp:1332 FireRay; no-insertion control for cached_bilinear_hit",
+      "inputs": {
+        "surfaces": [{"kind":"bezier","p":1,"q":1,"net":[[[0,0,0,1],[0,4,0,1]],[[4,0,0,1],[4,4,1,1]]]}],
+        "grid": {"bbox":[-1,-1,-1,5,5,5],"size":[4,4,4],"ray_tol":1e-5,"ray_acc":1e-8},
+        "ops": [{"op":"fire","p":[2,2,1],"v":[0,0,-1],"max_t":2,"hit_any":false,"skip":null}]
+      }
+    },
+    {
+      "name": "cached_then_explicit_leaf_skip",
+      "upstream_ref": "source/SMLib/src/SmRayTracer.cpp:1711 AddSurfaceToGrid; explicit AddLeaf identity and FireRay skip control",
+      "inputs": {
+        "surfaces": [
+          {"kind":"plane","o":[0,0,0],"x":[1,0,0],"y":[0,1,0],"scale":[1,1],"domain":[0,0,4,4]},
+          {"kind":"plane","o":[0,0,0.5],"x":[1,0,0],"y":[0,1,0],"scale":[1,1],"domain":[0,0,4,4]}
+        ],
+        "grid": {"bbox":[-1,-1,-1,5,5,5],"size":[4,4,4],"ray_tol":1e-5,"ray_acc":1e-8},
+        "ops": [
+          {"op":"add_surface","surface":0},
+          {"op":"add_leaf","surface":1,"uv":[0,0,4,4],"bbox":[0,0,0.5,4,4,0.5],"pseudo":[0,0,0.5,4,4,0.5],"polar":[[0,0,1]],"elem_box":[-0.1,-0.1,0.4,4.1,4.1,0.6]},
+          {"op":"fire","p":[2,2,2],"v":[0,0,-1],"max_t":3,"hit_any":false,"skip":null},
+          {"op":"fire","p":[2,2,2],"v":[0,0,-1],"max_t":3,"hit_any":false,"skip":0}
+        ]
+      }
+    }
+  ]
+}

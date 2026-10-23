@@ -48,10 +48,13 @@
 //! - **Grid elements of other types.** `FireRay` asserts (debug builds only) that a
 //!   non-polygon element is a surface element and casts it regardless; an element
 //!   of another type (user data, hierarchy) is [`SolidError::InvalidInput`] here.
-//! - **Surface leaf data.** `SmSurfaceGridElement::Init` is unported
-//!   (`geom::grid`), so surface leaves enter the grid through
-//!   [`Grid::add_surface_element`] with their data filled in
-//!   ([`SurfaceGridElement`] is co-ported by this unit).
+//! - **Surface leaf data.** `AddSurfaceToGrid` holds the real surface cache while
+//!   [`Grid::expand_hierarchy_with`] visits its leaves. [`surface_leaf`] reads each
+//!   leaf's actual domain, normal/pseudo/polar boxes and surface. A lazy polar box is
+//!   obtained without storing it; the cache accessor preserves the native values.
+//!   As upstream, the expansion's ordinary error status is ignored; an unported
+//!   dependency is always propagated. The bbox-only overload still cannot resolve
+//!   a cache from an opaque surface handle.
 //! - **`SE` in `SmSurfaceGridElement::Init`.** Upstream signals an error and carries
 //!   on. [`surface_leaf`] retries a failed `Evaluate` without `non_zero_tangents`
 //!   (the failure comes after the plain NLib derivatives are in `sEval`, before the
@@ -89,7 +92,9 @@ use crate::geom::geom_utility::p1::{
     circle_coplanar_circle_intersect, line_closest_point, line_coplanar_circle_intersect,
     line_plane_intersect_uv, CircleCircle,
 };
-use crate::geom::grid::{ElementId, Grid, GridItem, HierarchyElement, SurfaceGridElement};
+use crate::geom::grid::{
+    ElementId, Grid, GridItem, HierarchyElement, HierarchyId, SurfaceGridElement,
+};
 use crate::geom::object::ObjectRef;
 use crate::geom::polar_box::PolarBox;
 use crate::geom::pseudo_box::PseudoBox;
@@ -1121,17 +1126,36 @@ impl<'s> RayTracer<'s> {
     /// # Errors
     ///
     /// `SM_ERR` when the surface cache or its tree is missing (or has no top node),
-    /// and those of the cache and tree builds and of
-    /// [`RayTracer::add_surface_with_bbox`] (its [`Grid::expand_hierarchy`] is
-    /// [`SolidError::Unported`] today).
+    /// and those of the cache and tree builds, hierarchy insertion and unported
+    /// dependencies of leaf initialization.
     pub fn add_surface_to_grid(&mut self, k: &Kernel, surface: &'s Surface) -> Result<()> {
         const OP: &str = "intersect::ray_tracer::add_surface_to_grid";
         // build the surface spatial decomposition by building the surface cache
-        let mut cache = surface_cache::<usize>(k, surface, None)?;
-        let tree = cache.get_tree(k)?;
+        // The cache's surface handle is the slot registration below will allocate.
+        let mut cache = surface_cache(k, surface, Some(self.surfaces.len()))?;
+        cache.get_tree(k)?;
+        let tree = cache.tree().ok_or(SolidError::sm_err(OP))?;
         let top = tree.top_node().ok_or(SolidError::sm_err(OP))?;
         let bbox = tree.node(top)?.bbox;
-        self.add_surface_with_bbox(surface, &bbox)
+        let id = self.add_surface_hierarchy(surface, &bbox)?;
+        let expanded = self.grid.expand_hierarchy_with(id, tree, |index, node| {
+            let patch = cache.patch(node)?;
+            let polar = cache.polar_box_unstored(k, node)?;
+            surface_leaf(
+                k,
+                index,
+                surface,
+                &patch.aux.uv_domain,
+                &tree.node(node)?.bbox,
+                patch.pseudo_box(),
+                &polar,
+            )
+        });
+        // AddSurfaceToGrid ignores ExpandHierarchy's status upstream.
+        match expanded {
+            Err(e) if e.is_unported() => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Embeds the faces of a poly B-rep in the grid (`AddPolyBrepToGrid`).
@@ -1163,6 +1187,16 @@ impl<'s> RayTracer<'s> {
         surface: &'s Surface,
         top_node_bbox: &Extent3d,
     ) -> Result<()> {
+        let id = self.add_surface_hierarchy(surface, top_node_bbox)?;
+        self.grid.expand_hierarchy(id)
+    }
+
+    /// Shared registration before expansion, preserving native list and box order.
+    fn add_surface_hierarchy(
+        &mut self,
+        surface: &'s Surface,
+        top_node_bbox: &Extent3d,
+    ) -> Result<HierarchyId> {
         // set the bounding box = cached normal box increased by a small amount
         let mut surf_bbox = *top_node_bbox;
 
@@ -1175,11 +1209,7 @@ impl<'s> RayTracer<'s> {
 
         // add the surface to the grid's hierarchical element list
         let hierarchy = HierarchyElement::new_surface(index, self.ray_tolerance);
-        let id = self.grid.add_hierarchy_element(hierarchy, &surf_bbox)?;
-
-        // Expand the hierarchy element to avoid recomputing the surface cache a 2nd
-        // time
-        self.grid.expand_hierarchy(id)
+        self.grid.add_hierarchy_element(hierarchy, &surf_bbox)
     }
 }
 

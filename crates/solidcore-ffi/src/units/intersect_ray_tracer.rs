@@ -13,7 +13,9 @@
 //!
 //! where `<solution>` is `type num_variables num_objects solution_value p[0..10] surface
 //! object1 node0` (`surface` the surface index or `-1`, `object1` `-1` for null, `node0` `1`
-//! when `m_apNodes[0]` is set). `SolverTol`, `AddLeaf` and `AddSurface` add nothing.
+//! when `m_apNodes[0]` is set). `SolverTol` and `AddLeaf` add nothing; `AddSurface`
+//! emits its actual setup status (`0` for `SM_SUCCESS`). Fire candidate ids name
+//! explicit `AddLeaf` entries; cache-created candidates use the native encoder's `-1`.
 //!
 //! | [`Op`]       | upstream                                                                    |
 //! |--------------|-----------------------------------------------------------------------------|
@@ -21,7 +23,7 @@
 //! | `AddLeaf`    | `SmGrid::AddElement(SM_GE_SURFACE)` with `SmSurfaceGridElement::Init` (the box data given, the mid-point data computed from the surface) |
 //! | `Fire`       | `SmRayTracer::FireRay`                                                      |
 //! | `Local`      | `SmLSI3LocalSolver::LocalSolve` on a leaf                                   |
-//! | `AddSurface` | `SmRayTracer::AddSurfaceToGrid` (not run: needs the surface cache)          |
+//! | `AddSurface` | `SmRayTracer::AddSurfaceToGrid` (real surface cache; observed setup status) |
 //!
 //! [`run`] accepts only finite inputs of magnitude at most [`MAX_COORD`] (ray parameters and
 //! tolerances: any finite value); planes with independent axes and positive scales; Bezier
@@ -181,7 +183,7 @@ pub enum Op {
     Fire(FireIn),
     /// `LocalSolve`.
     Local(LocalIn),
-    /// `AddSurfaceToGrid` of a surface index (not run).
+    /// `AddSurfaceToGrid` of a surface index; emits its observed setup status.
     AddSurface(usize),
     /// `SmRayRenderer(tracer, SmAxis2Placement(origin, x, y), view, nx, ny)` taking over the
     /// tracer, then `SetSampleRate`; once per program.

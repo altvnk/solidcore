@@ -347,8 +347,7 @@ int32_t run(const double* p, int64_t n, std::vector<double>& o)
                 break;
             }
             case OP_ADD_SURFACE:
-                // needs the surface cache; the Rust side is deferred, nothing to compare
-                rd.idx(0, nsurf - 1);
+                o.push_back(st(rt->AddSurfaceToGrid(surfs.at((size_t)rd.idx(0, nsurf - 1)))));
                 break;
             case OP_RENDERER:
             {

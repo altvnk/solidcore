@@ -9,14 +9,14 @@
 //! leaf's domain, boxes and polar vectors as data and the mid-point data computed from the
 //! surface as `SmSurfaceGridElement::Init` does), `fire` (`SmRayTracer::FireRay`), `local`
 //! (`SmLSI3LocalSolver::LocalSolve` on one leaf) and `add_surface`
-//! (`SmRayTracer::AddSurfaceToGrid`, not run in C++: it needs the surface cache). Both sides
+//! (`SmRayTracer::AddSurfaceToGrid`, using the real surface cache on both sides). Both sides
 //! produce the flat record documented in the ffi module, reported as the values `rec`.
 //!
-//! Deferred cases: every ray or solve that gets past the leaf's pseudo box test reaches
-//! `SmSurface::LocalLineIntersect` (`surface.surface_p8`); `add_surface` builds the surface cache and
-//! then needs `SmSurface::CalculateContinuities` (`surface.surface_p6`). The generator makes mostly cases whose rays are rejected before
-//! that (grid miss, element box rejection by parameter, skipped element, pseudo box miss) and
-//! checks that with the Rust side, plus free cases that defer.
+//! The original generator favors rays rejected before local surface intersection
+//! (grid miss, parameter bounds, skipped element, pseudo box miss), with free cases
+//! as well. Cache-sequence fixtures separately observe native setup statuses and
+//! insertion-dependent hits, misses, input-surface identities and explicit-leaf skips.
+//! Any unported downstream service still propagates as a deferral.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -362,14 +362,14 @@ fn status_of(e: &SolidError) -> f64 {
     }
 }
 
-fn put_solution(o: &mut Vec<f64>, s: &Solution<RayObject>) {
+fn put_solution(o: &mut Vec<f64>, s: &Solution<RayObject>, surface_ids: &[usize]) {
     o.push(f64::from(s.solution_type.code()));
     o.push(s.num_variables as f64);
     o.push(s.num_objects as f64);
     o.push(s.start.solution_value);
     o.extend(s.start.parameters);
     o.push(match s.objects.first().copied().flatten() {
-        Some(RayObject::Surface(i)) => i as f64,
+        Some(RayObject::Surface(i)) => surface_ids.get(i).map_or(-2.0, |i| *i as f64),
         Some(_) => -2.0,
         None => -1.0,
     });
@@ -450,6 +450,10 @@ fn run_rust(k: &Kernel, i: &Inputs, st: &mut Stats) -> solidcore::Result<Vec<f64
         };
     }
     let mut leaves: Vec<SurfaceGridElement<usize>> = Vec::new();
+    // Native selectors name explicit AddLeaf entries, not cache-created elements.
+    let mut leaf_ids: Vec<ElementId> = Vec::new();
+    // Native solution serialization finds the surface in the original input list.
+    let mut surface_ids: Vec<usize> = (0..surfaces.len()).collect();
     let mut rec: Vec<f64> = Vec::new();
     let bad_index = |what: &'static str| SolidError::InvalidInput {
         operation: "difftest::intersect_ray_tracer",
@@ -492,10 +496,11 @@ fn run_rust(k: &Kernel, i: &Inputs, st: &mut Stats) -> solidcore::Result<Vec<f64
                     },
                     &polar_box,
                 )?;
-                tracer!()
+                let id = tracer!()
                     .grid_mut()
                     .add_surface_element(leaf, &ext3(*elem_box))?;
                 leaves.push(leaf);
+                leaf_ids.push(id);
             }
             OpIn::Fire {
                 p,
@@ -506,15 +511,24 @@ fn run_rust(k: &Kernel, i: &Inputs, st: &mut Stats) -> solidcore::Result<Vec<f64
             } => {
                 let tracer = tracer!();
                 tracer.hit_any_thing = *hit_any;
-                tracer.skip_element = skip.map(ElementId);
+                tracer.skip_element = skip
+                    .map(|i| leaf_ids.get(i).copied().ok_or_else(|| bad_index("skip")))
+                    .transpose()?;
                 st.fires += 1;
                 match tracer.fire_ray(k, v3(*p), v3(*v), *max_t) {
                     Ok(hit) => {
                         rec.push(0.0);
                         rec.push(f64::from(u8::from(hit.hits_something)));
-                        put_solution(&mut rec, &hit.solution);
+                        put_solution(&mut rec, &hit.solution, &surface_ids);
                         rec.push(hit.grid_elements.len() as f64);
-                        rec.extend(hit.grid_elements.iter().map(|e| e.0 as f64));
+                        rec.extend(hit.grid_elements.iter().map(|e| {
+                            // The native encoder uses -1 for a cache-created element
+                            // absent from its explicit AddLeaf pointer list.
+                            leaf_ids
+                                .iter()
+                                .position(|id| id == e)
+                                .map_or(-1.0, |i| i as f64)
+                        }));
                         rec.extend(&hit.min_distances);
                         rec.extend(&hit.max_distances);
                         st.walks += 1;
@@ -529,7 +543,7 @@ fn run_rust(k: &Kernel, i: &Inputs, st: &mut Stats) -> solidcore::Result<Vec<f64
                         st.errors += 1;
                         rec.push(status_of(&e));
                         rec.push(0.0);
-                        put_solution(&mut rec, &Solution::new());
+                        put_solution(&mut rec, &Solution::new(), &surface_ids);
                         rec.push(0.0);
                     }
                 }
@@ -573,11 +587,19 @@ fn run_rust(k: &Kernel, i: &Inputs, st: &mut Stats) -> solidcore::Result<Vec<f64
                 }
                 rec.push(f64::from(u8::from(r.found_intersection)));
                 rec.push(f64::from(u8::from(r.needs_more_subdivision)));
-                put_solution(&mut rec, &r.solution);
+                put_solution(&mut rec, &r.solution, &surface_ids);
             }
             OpIn::AddSurface { surface } => {
                 let surf = surfaces.get(*surface).ok_or_else(|| bad_index("surface"))?;
-                tracer!().add_surface_to_grid(&Kernel::default(), surf)?;
+                let tracer = tracer!();
+                let before = tracer.surfaces().len();
+                let result = tracer.add_surface_to_grid(k, surf);
+                surface_ids.extend((before..tracer.surfaces().len()).map(|_| *surface));
+                match result {
+                    Ok(()) => rec.push(0.0),
+                    Err(e @ SolidError::Unported { .. }) => return Err(e),
+                    Err(e) => rec.push(status_of(&e)),
+                }
             }
             OpIn::Renderer {
                 origin,
@@ -1149,6 +1171,9 @@ impl UnitDiff for Runner {
         default_cases(self, &ctx)
     }
 }
+
+#[cfg(all(test, feature = "cpp"))]
+mod cache_integration;
 
 #[cfg(test)]
 mod tests {
