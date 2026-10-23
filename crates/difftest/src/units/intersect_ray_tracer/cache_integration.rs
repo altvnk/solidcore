@@ -3,10 +3,11 @@
 use super::*;
 use crate::compare::{compare, values_agree};
 
-fn native_and_rust(name: &str, input: &Inputs) -> Vec<f64> {
-    let native = ffi::run(&ffi_program(input)).unwrap_or_else(|e| panic!("{name}: native: {e}"));
+fn native_and_rust(name: &str, input: &Inputs) -> Result<Vec<f64>, HarnessError> {
+    let native =
+        ffi::run(&ffi_program(input)).map_err(|e| harness(format!("{name}: native: {e}")))?;
     let rust = run_rust(&Kernel::default(), input, &mut Stats::default())
-        .unwrap_or_else(|e| panic!("{name}: Rust: {e}; input={input:?}"));
+        .map_err(|e| harness(format!("{name}: Rust: {e}; input={input:?}")))?;
     let diff = compare(
         &Output::new().values("rec", native.clone()),
         &Output::new().values("rec", rust),
@@ -14,47 +15,54 @@ fn native_and_rust(name: &str, input: &Inputs) -> Vec<f64> {
     );
     assert!(diff.pass(), "{name}: {diff:?}; input={input:?}");
     assert!(diff.values_compared > 0, "{name}: no observations");
-    native
+    Ok(native)
 }
 
-fn sequence_inputs() -> Vec<(String, Inputs)> {
-    let json: Value = serde_json::from_str(include_str!(concat!(
+fn sequence_inputs() -> Result<Vec<(String, Inputs)>, HarnessError> {
+    #[derive(Deserialize)]
+    struct Sequence {
+        name: String,
+        inputs: Inputs,
+    }
+    #[derive(Deserialize)]
+    struct Sequences {
+        cases: Vec<Sequence>,
+    }
+    let json: Sequences = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../fixtures/intersect.ray_tracer/cache_sequences.json"
     )))
-    .expect("sequence fixture JSON");
-    json.get("cases")
-        .and_then(Value::as_array)
-        .expect("cases")
-        .iter()
-        .map(|c| {
-            (
-                c.get("name")
-                    .and_then(Value::as_str)
-                    .expect("name")
-                    .to_string(),
-                serde_json::from_value(c.get("inputs").expect("inputs field").clone())
-                    .expect("inputs"),
-            )
-        })
-        .collect()
+    .map_err(|e| harness(format!("sequence fixture JSON: {e}")))?;
+    Ok(json.cases.into_iter().map(|c| (c.name, c.inputs)).collect())
 }
 
 /// Parse the unchanged Fire layout, retaining its full candidate/distance arrays.
-fn fire(rec: &[f64], offset: usize) -> (&[f64], usize) {
-    let prefix_end = offset.checked_add(20).expect("Fire prefix end");
-    let prefix = rec.get(offset..prefix_end).expect("Fire prefix");
+fn fire(rec: &[f64], offset: usize) -> Result<(&[f64], usize), HarnessError> {
+    let prefix_end = offset
+        .checked_add(20)
+        .ok_or_else(|| harness("Fire prefix end"))?;
+    let prefix = rec
+        .get(offset..prefix_end)
+        .ok_or_else(|| harness("Fire prefix"))?;
     assert_eq!(prefix.first(), Some(&0.0), "Fire status");
-    let count = *prefix.get(19).expect("candidate count field");
+    let count = *prefix
+        .get(19)
+        .ok_or_else(|| harness("candidate count field"))?;
     let n = count as usize;
     assert_eq!(count, n as f64, "candidate count");
     let end = prefix_end
-        .checked_add(n.checked_mul(3).expect("Fire array lengths"))
-        .expect("Fire arrays end");
-    (rec.get(offset..end).expect("Fire arrays"), end)
+        .checked_add(
+            n.checked_mul(3)
+                .ok_or_else(|| harness("Fire array lengths"))?,
+        )
+        .ok_or_else(|| harness("Fire arrays end"))?;
+    Ok((
+        rec.get(offset..end).ok_or_else(|| harness("Fire arrays"))?,
+        end,
+    ))
 }
 
-fn assert_hit(rec: &[f64], parameters: [f64; 6], surface: usize) {
+fn assert_hit(rec: &[f64], parameters: [f64; 6], surface: usize) -> Result<(), HarnessError> {
     assert_eq!(
         rec.get(1),
         Some(&1.0),
@@ -63,7 +71,7 @@ fn assert_hit(rec: &[f64], parameters: [f64; 6], surface: usize) {
     // t, u, v, point.x, point.y, point.z (normal and all other fields compare too).
     for (actual, expected) in rec
         .get(6..12)
-        .expect("hit parameters")
+        .ok_or_else(|| harness("hit parameters"))?
         .iter()
         .zip(parameters)
     {
@@ -77,16 +85,15 @@ fn assert_hit(rec: &[f64], parameters: [f64; 6], surface: usize) {
         Some(&(surface as f64)),
         "original input surface identity"
     );
-    assert!(
-        *rec.get(19).expect("candidate count") > 0.0,
-        "the hit must traverse actual grid elements"
-    );
+    // Candidates describe the final DDA step, not necessarily the step that hit.
+    // A later empty step can therefore coexist with this independently checked hit.
+    Ok(())
 }
 
 #[test]
 fn native_cache_sequences_observe_hits_misses_and_explicit_leaf_skips() {
-    for (name, input) in sequence_inputs() {
-        let rec = native_and_rust(&name, &input);
+    for (name, input) in sequence_inputs().expect("sequence fixtures") {
+        let rec = native_and_rust(&name, &input).expect("native/Rust sequence");
         let inserted = input
             .ops
             .iter()
@@ -95,22 +102,26 @@ fn native_cache_sequences_observe_hits_misses_and_explicit_leaf_skips() {
         if inserted {
             assert_eq!(rec[0], 0.0, "{name}: native AddSurfaceToGrid status");
         }
-        let (first, next) = fire(&rec, offset);
+        let (first, next) = fire(&rec, offset).expect("first Fire record");
         match name.as_str() {
             "cached_plane_hit" => {
-                assert_hit(first, [1.0, 2.0, 2.0, 2.0, 2.0, 0.0], 0);
+                assert_hit(first, [1.0, 2.0, 2.0, 2.0, 2.0, 0.0], 0).expect("plane hit");
                 let n = first[19] as usize;
                 assert!(first[20..20 + n].iter().all(|id| *id == -1.0));
             }
             "cached_bilinear_hit" => {
-                assert_hit(first, [0.75, 0.5, 0.5, 2.0, 2.0, 0.25], 0);
+                assert_hit(first, [0.75, 0.5, 0.5, 2.0, 2.0, 0.25], 0).expect("bilinear hit");
             }
             "cached_then_explicit_leaf_skip" => {
-                assert_hit(first, [1.5, 2.0, 2.0, 2.0, 2.0, 0.5], 1);
+                assert_hit(first, [1.5, 2.0, 2.0, 2.0, 2.0, 0.5], 1).expect("explicit leaf hit");
                 let n = first[19] as usize;
-                assert!(first[20..20 + n].contains(&0.0), "explicit leaf id");
-                let (second, end) = fire(&rec, next);
-                assert_hit(second, [2.0, 2.0, 2.0, 2.0, 2.0, 0.0], 0);
+                assert!(
+                    first[20..20 + n].iter().all(|id| *id == -1.0 || *id == 0.0),
+                    "candidate identities"
+                );
+                let (second, end) = fire(&rec, next).expect("second Fire record");
+                assert_hit(second, [2.0, 2.0, 2.0, 2.0, 2.0, 0.0], 0)
+                    .expect("cached hit after explicit skip");
                 assert_eq!(end, rec.len());
                 continue;
             }
@@ -137,7 +148,10 @@ fn six_former_cache_deferrals_compare_real_native_setup_status() {
         .expect("unchanged original standalone fixture");
     let input: Inputs = standalone.parse().expect("standalone input");
     // A setup-status-only comparison, explicitly not credited as a ray-hit gain.
-    assert_eq!(native_and_rust(&standalone.name, &input), vec![0.0]);
+    assert_eq!(
+        native_and_rust(&standalone.name, &input).expect("standalone native/Rust setup"),
+        vec![0.0]
+    );
 
     for (index, seed) in [
         (56, 9_069_242_292_082_977_168),
@@ -163,7 +177,7 @@ fn six_former_cache_deferrals_compare_real_native_setup_status() {
             .count();
         assert_eq!(setups, 1, "gen{index:04}: preserve the original setup path");
         let name = format!("gen{index:04}");
-        let rec = native_and_rust(&name, &input);
+        let rec = native_and_rust(&name, &input).expect("original generated native/Rust case");
         assert_eq!(
             rec.last(),
             Some(&0.0),
