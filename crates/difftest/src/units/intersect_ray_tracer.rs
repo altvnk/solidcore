@@ -1173,6 +1173,7 @@ impl UnitDiff for Runner {
 }
 
 #[cfg(all(test, feature = "cpp"))]
+#[path = "intersect_ray_tracer/cache_integration.rs"]
 mod cache_integration;
 
 #[cfg(test)]

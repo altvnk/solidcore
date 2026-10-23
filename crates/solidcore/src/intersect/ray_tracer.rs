@@ -1579,7 +1579,8 @@ mod tests {
     }
 
     #[test]
-    fn adding_a_surface_needs_the_surface_cache() {
+    fn adding_a_surface_expands_real_cache_leaves() {
+        let k = &Kernel::default();
         let plane = Surface::from(crate::surface::plane::Plane::new(
             Vec3::new(0.0, 0.0, 0.0),
             Vec3::new(1.0, 0.0, 0.0),
@@ -1588,9 +1589,15 @@ mod tests {
             &Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0),
         ));
         let mut t = RayTracer::new(grid(), 1e-4, 1e-8);
-        assert!(matches!(
-            t.add_surface_to_grid(&Kernel::default(), &plane),
-            Err(SolidError::Unported { .. })
-        ));
+        t.add_surface_to_grid(k, &plane).unwrap();
+        assert_eq!(t.surfaces().len(), 1);
+        let hit = t
+            .fire_ray(k, Vec3::new(0.5, 0.5, 1.0), Vec3::new(0.0, 0.0, -1.0), 2.0)
+            .unwrap();
+        assert!(hit.hits_something);
+        assert!(!hit.grid_elements.is_empty());
+        assert_eq!(hit.solution.objects[0], Some(RayObject::Surface(0)));
+        assert_eq!(hit.solution.start.parameters[0], 1.0);
+        assert_eq!(hit.solution.start.parameters[3..6], [0.5, 0.5, 0.0]);
     }
 }
