@@ -23,14 +23,18 @@ fn sequence_inputs() -> Vec<(String, Inputs)> {
         "/../../fixtures/intersect.ray_tracer/cache_sequences.json"
     )))
     .expect("sequence fixture JSON");
-    json["cases"]
-        .as_array()
+    json.get("cases")
+        .and_then(Value::as_array)
         .expect("cases")
         .iter()
         .map(|c| {
             (
-                c["name"].as_str().expect("name").to_string(),
-                serde_json::from_value(c["inputs"].clone()).expect("inputs"),
+                c.get("name")
+                    .and_then(Value::as_str)
+                    .expect("name")
+                    .to_string(),
+                serde_json::from_value(c.get("inputs").expect("inputs field").clone())
+                    .expect("inputs"),
             )
         })
         .collect()
@@ -38,25 +42,45 @@ fn sequence_inputs() -> Vec<(String, Inputs)> {
 
 /// Parse the unchanged Fire layout, retaining its full candidate/distance arrays.
 fn fire(rec: &[f64], offset: usize) -> (&[f64], usize) {
-    let prefix = rec.get(offset..offset + 20).expect("Fire prefix");
-    assert_eq!(prefix[0], 0.0, "Fire status");
-    let n = prefix[19] as usize;
-    assert_eq!(prefix[19], n as f64, "candidate count");
-    let end = offset + 20 + 3 * n;
+    let prefix_end = offset.checked_add(20).expect("Fire prefix end");
+    let prefix = rec.get(offset..prefix_end).expect("Fire prefix");
+    assert_eq!(prefix.first(), Some(&0.0), "Fire status");
+    let count = *prefix.get(19).expect("candidate count field");
+    let n = count as usize;
+    assert_eq!(count, n as f64, "candidate count");
+    let end = prefix_end
+        .checked_add(n.checked_mul(3).expect("Fire array lengths"))
+        .expect("Fire arrays end");
     (rec.get(offset..end).expect("Fire arrays"), end)
 }
 
 fn assert_hit(rec: &[f64], parameters: [f64; 6], surface: usize) {
-    assert_eq!(rec[1], 1.0, "must hit after actual cache insertion");
+    assert_eq!(
+        rec.get(1),
+        Some(&1.0),
+        "must hit after actual cache insertion"
+    );
     // t, u, v, point.x, point.y, point.z (normal and all other fields compare too).
-    for (actual, expected) in rec[6..12].iter().zip(parameters) {
+    for (actual, expected) in rec
+        .get(6..12)
+        .expect("hit parameters")
+        .iter()
+        .zip(parameters)
+    {
         assert!(
             values_agree(*actual, expected, None),
             "hit field {actual} != {expected}"
         );
     }
-    assert_eq!(rec[16], surface as f64, "original input surface identity");
-    assert!(rec[19] > 0.0, "the hit must traverse actual grid elements");
+    assert_eq!(
+        rec.get(16),
+        Some(&(surface as f64)),
+        "original input surface identity"
+    );
+    assert!(
+        *rec.get(19).expect("candidate count") > 0.0,
+        "the hit must traverse actual grid elements"
+    );
 }
 
 #[test]
