@@ -17,6 +17,7 @@
 //! | [`stitch_and_orient`] | `SmBrep::StitchAndOrient` |
 //! | [`squeeze_face`] | `SmBrep::SqueezeFace` |
 //! | [`transform`] | `SmBrep::Transform(const SmAxis2Placement&, ...)` (the 4x4 matrix overload is not owned by this unit) |
+//! | [`turn_to_nurbs_plain`] | `SmBrep::TurnToNURBS()` as a plain entry point (the edit is `topology.brep_p3`'s) |
 //! | [`PendingTopology`] | `SmPendingTopologyDelete` constructor/destructor and `Clear` (co-port) |
 //!
 //! Deviations: dependency-limited editing. All twelve owned editing
@@ -54,6 +55,12 @@
 //! vertex and vertex-use record erasure requires part 4's owning-storage lifecycle: the shared
 //! arena is append-only, so shifting ids or leaving a visible dummy is invalid.
 //! Debug drawing/assertions are omitted. No recursion is introduced.
+//! `DeleteTopologicalVertex` leaves the vertex in place (the routine's silent `SM_ERR`)
+//! for an edge curve that is not of an `SmBSplineCurve` kind, where upstream dereferences
+//! the null cast (WR-598, the fork's tangency-labs/smlib@829b982); joining a curve on a
+//! B-spline-kind surface along a constant-u or constant-v UV line as that iso curve is
+//! opt-in (`Kernel::fixes.delete_vertex_joins_seam_iso_curve`). A line joined through
+//! the `SmBSplineCurve` join gets its NURB made first, as `GetOrCreateGwNurbPointer` does.
 
 use crate::curve::curve::Curve;
 use crate::error::{Result, SolidError};
@@ -120,7 +127,8 @@ const OP: &str = "topology::brep::p5";
 
 /// Runs `f` with the caller's notification environment, or, for a plain entry point
 /// (`notifications` is `None`: the caller keeps no notification state of its own),
-/// with an [`brep_p2::ArenaNotifyState`] of `b` notifying through `context`. `f`'s last
+/// with an [`brep_p2::ArenaNotifyState`] of `b` (holding `b`'s own attributes for the
+/// edit) notifying through `context`. `f`'s last
 /// argument is the context the caller's own environment falls back to (`context`
 /// then; `None` for the arena state, which already holds it).
 pub(super) fn with_notifications<R>(
@@ -136,9 +144,13 @@ pub(super) fn with_notifications<R>(
     if let Some(env) = notifications {
         f(b, env, context)
     } else {
-        let mut state = brep_p2::ArenaNotifyState::new(b);
-        let mut env = state.env(context);
-        f(b, &mut env, None)
+        // (not upstream) with `b`'s own attributes, given back afterwards
+        let mut state = brep_p2::ArenaNotifyState::with_attributes_of(b);
+        let r = f(b, &mut state.env(context), None);
+        let restored = state.restore_attributes(b);
+        let r = r?;
+        restored?;
+        Ok(r)
     }
 }
 
@@ -757,8 +769,8 @@ pub fn delete_topological_vertex_with_notifications(
     // that metadata. Coincidence classification still handles equal geometry.
     let mut same_geometry = false;
     if !same_geometry {
-        let delete_curve = edge_curve(b, deleted)?;
-        let survive_curve = edge_curve(b, survivor)?;
+        let delete_curve = edge_curve_with_tolerance(b, deleted)?;
+        let survive_curve = edge_curve_with_tolerance(b, survivor)?;
         let deleted_range = delete_curve.natural_interval();
         let survivor_range = survive_curve.natural_interval();
         // The native overload defaults bSnapToEnds to TRUE. Its additional-work
@@ -767,7 +779,7 @@ pub fn delete_topological_vertex_with_notifications(
             crate::error::ignored(delete_curve.global_coincidence_checker::<JoinCurve>(
                 k,
                 &deleted_range,
-                survive_curve,
+                &survive_curve,
                 &survivor_range,
                 0.001,
                 true,
@@ -834,20 +846,19 @@ pub fn delete_topological_vertex_with_notifications(
         };
         b.edge_mut(survivor)?.interval.add_value(far);
     } else {
-        let mut deleted_copy = edge_curve(b, deleted)?.copy(k)?;
-        let mut interval = deleted_interval;
-        deleted_copy.trim(
-            k,
-            &mut interval,
-            crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
-        )?;
-        let mut surviving_copy = edge_curve(b, survivor)?.copy(k)?;
-        interval = survivor_interval;
-        surviving_copy.trim(
-            k,
-            &mut interval,
-            crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
-        )?;
+        // Upstream casts each copy to `SmBSplineCurve` and calls `Trim` through the
+        // result unchecked, so an edge curve of another kind (an `SmCrvOnSurf`) is a null
+        // dereference (WR-598). Here such a curve is not joined: the routine's silent
+        // error, with nothing changed yet (the fork's tangency-labs/smlib@829b982).
+        // `Kernel::fixes.delete_vertex_joins_seam_iso_curve` also joins a curve on a
+        // B-spline surface along a constant-u or constant-v UV line as that iso curve.
+        let Some(mut deleted_copy) = exact_bspline_of_edge(k, b, deleted, deleted_interval)? else {
+            return Err(SolidError::sm_err(OP));
+        };
+        let Some(mut surviving_copy) = exact_bspline_of_edge(k, b, survivor, survivor_interval)?
+        else {
+            return Err(SolidError::sm_err(OP));
+        };
         if crate::error::ignored(join_copied_curves(
             k,
             &mut surviving_copy,
@@ -908,12 +919,111 @@ pub fn delete_topological_vertex_with_notifications(
     Ok(())
 }
 
+/// The edge's curve as a B-spline over the edge's interval, running the curve's way, to
+/// join it with its neighbour (the fork's `sm_ExactBSplineOfEdge`, tangency-labs/smlib@829b982):
+/// a curve of an `SmBSplineCurve` kind (lines and conics included) copied and trimmed, as
+/// upstream does. Any other curve is `None`; upstream dereferences the null cast instead
+/// (WR-598). With `Kernel::fixes.delete_vertex_joins_seam_iso_curve`, a curve on a
+/// B-spline-kind surface whose UV curve is a line of constant u or v (the seam an
+/// extrusion leaves on its wall) is that surface's iso curve over the stretch, which is
+/// the same curve exactly.
+fn exact_bspline_of_edge(
+    k: &Kernel,
+    b: &Brep,
+    edge: EdgeId,
+    interval: Extent1d,
+) -> Result<Option<Curve>> {
+    use crate::curve::curve::p2::{BSPLINE_CURVE_TYPE, LINE_TYPE};
+    use crate::curve::curve::CurveKind;
+    let curve = edge_curve(b, edge)?;
+    if curve.is_kind_of(BSPLINE_CURVE_TYPE) {
+        let mut copy = curve.copy(k)?;
+        let mut interval = interval;
+        // may snap the interval by tol to existing knots
+        copy.trim(
+            k,
+            &mut interval,
+            crate::nurbs::b_spline_curve_n_lib::TrimMode::Notify,
+        )?;
+        return Ok(Some(copy));
+    }
+    if !k.fixes.delete_vertex_joins_seam_iso_curve {
+        return Ok(None);
+    }
+    let CurveKind::CrvOnSurf(cos) = curve.kind() else {
+        return Ok(None);
+    };
+    let uv_curve = cos.uv_curve();
+    if !uv_curve.is_kind_of(LINE_TYPE) {
+        return Ok(None);
+    }
+    let surface = cos.surface();
+    if !surface.is_kind_of(crate::surface::surface::p2::B_SPLINE_SURFACE_TYPE)? {
+        return Ok(None);
+    }
+    let a = uv_curve.evaluate_point(k, interval.min())?;
+    let bb = uv_curve.evaluate_point(k, interval.max())?;
+    let dom = surface.natural_uv_domain_with_nurb(k)?;
+    let zero_u = crate::math::EFF_ZERO * dom.u_interval().length();
+    let zero_v = crate::math::EFF_ZERO * dom.v_interval().length();
+    let (iso, iso_value, from, to) = if (a.x - bb.x).abs() <= zero_u {
+        (
+            crate::nurbs::b_spline_surface::SurfParamType::U,
+            a.x,
+            a.y,
+            bb.y,
+        )
+    } else if (a.y - bb.y).abs() <= zero_v {
+        (
+            crate::nurbs::b_spline_surface::SurfParamType::V,
+            a.y,
+            a.x,
+            bb.x,
+        )
+    } else {
+        return Ok(None);
+    };
+    let trim = if iso == crate::nurbs::b_spline_surface::SurfParamType::U {
+        crate::geom::extent2d::Extent2d::from_bounds(
+            iso_value,
+            crate::math::min2(from, to),
+            iso_value,
+            max2(from, to),
+        )
+    } else {
+        crate::geom::extent2d::Extent2d::from_bounds(
+            crate::math::min2(from, to),
+            iso_value,
+            max2(from, to),
+            iso_value,
+        )
+    };
+    let mut iso_curve = surface
+        .create_iso_parametric_curve(k, iso, iso_value, 0.0, Some(&trim), false)?
+        .curve;
+    if to < from {
+        let natural = iso_curve.natural_interval();
+        iso_curve.reverse_parameterization(k, &natural)?;
+    }
+    Ok(Some(iso_curve))
+}
+
 fn edge_curve(b: &Brep, edge: EdgeId) -> Result<&Curve> {
     b.edge(edge)?
         .curve
         .as_ref()
         .ok_or_else(|| SolidError::null_pointer(OP))
 }
+
+/// An evaluation copy of the edge's curve carrying the edge's tolerance
+/// ([`Curve::set_owner_zone_tol_3d`]), so the caches its solves build use it as
+/// upstream's over the edge-owned curve (`SmTol::GetApproxTol3d(&m_crCurve)`).
+fn edge_curve_with_tolerance(b: &Brep, edge: EdgeId) -> Result<Curve> {
+    let mut curve = edge_curve(b, edge)?.clone_for_evaluation()?;
+    curve.set_owner_zone_tol_3d(Some(b.edge(edge)?.tolerance));
+    Ok(curve)
+}
+
 /// The two curves of `DeleteTopologicalVertex`'s coincidence check as its solutions
 /// name them (upstream's `pDeleteCurve`, `pSurviveCurve`), with the natural interval
 /// `IdenticalSolutions` reads through them (`SmCurve::GetNaturalInterval`).
@@ -966,11 +1076,17 @@ fn join_copied_curves(
         ),
     }
 }
+/// The `SmBSplineCurve` part of a curve of that kind. A line's NURB is made first when it
+/// has none, as upstream's `SmBSplineCurve` methods make it (`GetOrCreateGwNurbPointer`).
 fn bspline_curve_base_mut(curve: &mut Curve) -> Result<&mut BSplineCurve> {
     use crate::curve::curve::CurveKind;
+    let owner = curve.owner();
     match curve.kind_mut() {
         CurveKind::BSpline(base) => Ok(base),
-        CurveKind::Line(line) => Ok(line.base_mut()),
+        CurveKind::Line(line) => {
+            line.ensure_nurb(owner)?;
+            Ok(line.base_mut())
+        }
         CurveKind::Ellipse(ellipse) => Ok(ellipse.base_mut()),
         CurveKind::Hyperbola(hyperbola) => Ok(hyperbola.base_mut()),
         CurveKind::Parabola(parabola) => Ok(parabola.base_mut()),
@@ -2693,6 +2809,18 @@ fn transform_in(
         }
     }
     Ok(())
+}
+
+/// `SmBrep::TurnToNURBS()` as a plain entry point (the caller keeps no notification
+/// state of its own: `plain_edit`), with the geometry owners [`transform`]'s
+/// conversion uses.
+///
+/// # Errors
+///
+/// Those of [`crate::topology::brep::p3::turn_to_nurbs`]; `InvalidInput` for a call
+/// inside another lent edit (before anything changes).
+pub fn turn_to_nurbs_plain(k: &mut Kernel, b: &mut Brep) -> Result<()> {
+    turn_to_nurbs(k, b, None)
 }
 
 /// `SmBrep::TurnToNURBS()` ([`crate::topology::brep::p3::turn_to_nurbs`]), notifying as

@@ -32,10 +32,14 @@
 //! (`pOptContextForStack`) is the kernel. Notifications go to the caller's
 //! [`NotifyEnv`] (the B-rep spatial cache is not kept: no `BrepCacheSlot`).
 //!
-//! - **Records.** Upstream `delete` of a topology object unlinks it from its owning
-//!   list (`~SmTopology`); records stay in their arenas, unreachable, as in
-//!   `topology.brep_p2` (faces, edges and vertices leave the B-rep's lists, regions
-//!   leave the region list). The copy constructors build a new [`Brep`] and return it;
+//! - **Records.** Upstream `delete` of a topology object is the removal of its arena
+//!   record, after the object left its owning list (`~SmTopology`): `DeleteFace` and
+//!   `SqueezeEdge` remove every record they delete (the face, its face uses, loops,
+//!   loop uses and vertex uses, the merged region; the squeezed edge, its edge uses and
+//!   vertex uses and the deleted vertex), each after its last read (finding
+//!   `plan/findings/topology.brep_p3--deleted-records-stay-in-arenas.md`). Arena ids
+//!   are never reused, so the other records keep theirs. The copy constructors build a
+//!   new [`Brep`] and return it;
 //!   `MergeBrep` copies from another [`Brep`] (a self-merge, `MergeBrep(*this)`, cannot
 //!   be expressed).
 //! - **Ignored statuses.** The copy constructor ignores `MergeBrep`'s status (`SE`):
@@ -62,6 +66,13 @@
 //!   constructors of uses, loops, shells and regions do not notify
 //!   (`SM_NO_DESTRUCTION` / `SM_NO_CONSTRUCTION` at `SmObject` level; `new_brep`'s own
 //!   construction is reported); faces, edges and vertices do.
+//! - **B-rep-owned attributes.** Upstream's attributes live on the objects; the port's
+//!   live in each [`Brep`]'s own store ([`Brep::add_attribute`]). An edit under the
+//!   kernel's identities (`kernel_named_edit`, [`with_kernel_callbacks`]) lends `b`'s
+//!   store to the edit under those identities and gives back the lists of `b`'s live
+//!   objects afterwards; [`api_brep_copy`] lends the source's to the copy and the copy
+//!   keeps what the `SM_NO_COPY` notifications give it (a reference attribute becomes
+//!   one per B-rep). [`copy_brep`] and [`merge_brep`] use only the caller's `env`.
 //! - **Notification identities.** Upstream names every object in a notification by
 //!   its address. Topology keeps the [`NotifyEnv`] contract: `b`'s objects are named
 //!   by the caller's `env.key_of`, the objects of a B-rep an edit only reads
@@ -167,6 +178,7 @@ fn ignore_soft<T>(r: Result<T>) -> Result<()> {
         Err(
             e @ (SolidError::Unported { .. }
             | SolidError::InvalidInput { .. }
+            | SolidError::PortInvariant { .. }
             | SolidError::NotFound { .. }),
         ) => Err(e),
         Ok(_) | Err(_) => Ok(()),
@@ -523,8 +535,8 @@ fn faceuse_remove_loopuse(b: &mut Brep, fu: FaceuseId, lu: LoopuseId) -> Result<
 
 /// `m_pFaceListHead->Remove(pFace); delete pFace`: takes the face off the B-rep's face
 /// list, notifies its destruction (`~SmFace`: `SmFace::Notify`, unit
-/// `topology.face_p3`), drops the surface it owns and removes it from every attribute
-/// it uses (`~SmAObject`'s `ClearAttributes`).
+/// `topology.face_p3`), drops the surface it owns, removes it from every attribute
+/// it uses (`~SmAObject`'s `ClearAttributes`) and removes its record.
 fn destroy_face(b: &mut Brep, env: &mut NotifyEnv<'_>, f: FaceId) -> Result<()> {
     b.remove_from_face_list(f);
     ignore_soft(face_notify(
@@ -547,6 +559,8 @@ fn destroy_face(b: &mut Brep, env: &mut NotifyEnv<'_>, f: FaceId) -> Result<()> 
         face.surface = None;
         b.set_geometry_owner_key(EntityRef::Face(f), None);
     }
+    // delete pFace
+    b.remove_face_record(f)?;
     Ok(())
 }
 
@@ -663,6 +677,9 @@ pub fn copy_brep(
     let _ = copy_attributes;
     let mut b = Brep::new();
     b.set_key((env.key_of)(brep_entity()).key);
+    // (not upstream) the copy's geometry is owned by `env.key_of`'s identities
+    // (`SetOwner(pNewE)` etc. in `MergeBrep`), recorded per entity
+    b.set_naming(crate::topology::NamingScheme::Caller);
     b.set_editing_enabled(src.editing_enabled());
     b.set_validate_only(src.validate_only());
 
@@ -1015,16 +1032,18 @@ pub(crate) fn with_caller_identities_for<R>(
         context.issued_brep_serial(b.notify_identity())
     };
     let id = progress_id(b, serial, env.key_of);
+    let instance = b.progress_tag();
     {
         let window = allocation_window(b, source.map(|(src, _)| src), inputs);
-        check_keys_once(env.records, id.clone(), serial, b, env.key_of, window)?;
+        let progress = (id.clone(), std::sync::Arc::clone(&instance));
+        check_keys_once(env.records, progress, serial, b, env.key_of, window)?;
         if let Some((src, key_of)) = source {
             // (a source is read, never added to)
             let context = env.context.as_deref().unwrap_or(&k.context);
             check_keys(context, src, key_of, 0)?;
         }
     }
-    seed_records_once(env.records, id, b, env.key_of)?;
+    seed_records_once(env.records, (id, instance), b, env.key_of)?;
     if let Some((src, key_of)) = source {
         seed_records(env.records, src, key_of);
     }
@@ -1050,22 +1069,40 @@ fn kind_entity(kind: usize, index: u32) -> EntityRef {
     }
 }
 
-/// The kind (in [`entities`]' order) and arena index of a topology object.
-fn entity_slot(e: EntityRef) -> Option<(usize, usize)> {
-    let (kind, index) = match e {
-        EntityRef::Region(x) => (0, x.index()),
-        EntityRef::Shell(x) => (1, x.index()),
-        EntityRef::Faceuse(x) => (2, x.index()),
-        EntityRef::Face(x) => (3, x.index()),
-        EntityRef::Loopuse(x) => (4, x.index()),
-        EntityRef::Loop(x) => (5, x.index()),
-        EntityRef::Edgeuse(x) => (6, x.index()),
-        EntityRef::Edge(x) => (7, x.index()),
-        EntityRef::Vertexuse(x) => (8, x.index()),
-        EntityRef::Vertex(x) => (9, x.index()),
-        EntityRef::Brep(_) => return None,
-    };
-    Some((kind, usize::try_from(index).ok()?))
+/// Whether the object of kind `kind` (in [`entities`]' order) at arena index `index`
+/// is live (not a removed slot).
+fn is_live(b: &Brep, kind: usize, index: u32) -> bool {
+    match kind {
+        0 => b.regions().get(RegionId::from_index(index)).is_some(),
+        1 => b.shells().get(ShellId::from_index(index)).is_some(),
+        2 => b.faceuses().get(FaceuseId::from_index(index)).is_some(),
+        3 => b.faces().get(FaceId::from_index(index)).is_some(),
+        4 => b.loopuses().get(LoopuseId::from_index(index)).is_some(),
+        5 => b
+            .loops()
+            .get(crate::topology::LoopId::from_index(index))
+            .is_some(),
+        6 => b.edgeuses().get(EdgeuseId::from_index(index)).is_some(),
+        7 => b.edges().get(EdgeId::from_index(index)).is_some(),
+        8 => b.vertexuses().get(VertexuseId::from_index(index)).is_some(),
+        _ => b.vertices().get(VertexId::from_index(index)).is_some(),
+    }
+}
+
+/// The slot count of each kind, removed slots included (the next index of each).
+fn slot_counts(b: &Brep) -> [usize; KINDS] {
+    [
+        b.regions().slot_count(),
+        b.shells().slot_count(),
+        b.faceuses().slot_count(),
+        b.faces().slot_count(),
+        b.loopuses().slot_count(),
+        b.loops().slot_count(),
+        b.edgeuses().slot_count(),
+        b.edges().slot_count(),
+        b.vertexuses().slot_count(),
+        b.vertices().slot_count(),
+    ]
 }
 
 /// The live-object count of each kind (what [`prospective_entities`] counts from).
@@ -1093,23 +1130,21 @@ fn progress_id(b: &Brep, serial: Option<u64>, key_of: &dyn Fn(EntityRef) -> Obje
     id
 }
 
-/// Whether `flags[at]` is set; sets it (growing `flags`) and returns `false` if not.
-fn first_visit(flags: &mut Vec<bool>, at: usize) -> bool {
-    if flags.len() <= at {
-        flags.resize(at + 1, false);
-    }
-    flags
-        .get_mut(at)
-        .is_some_and(|f| !std::mem::replace(f, true))
-}
+/// One past the last arena index (ids are `u32`).
+const INDEX_END: usize = (u32::MAX as usize).saturating_add(1);
 
 /// [`check_keys`] of `b` (no source) for one edit, deciding each arena index once
-/// per store: an index's key depends on the index alone (`key_of`, under the same
-/// [`progress_id`]), so the objects and prospective indices the check covers are
-/// the same, and only those not yet passed are asked. A refusal marks nothing.
+/// per store and B-rep value (`progress`: the [`progress_id`] and
+/// [`Brep::progress_tag`]): an index's key depends on the index alone (`key_of`,
+/// under the same id), so the objects and prospective indices the check covers are
+/// the same, and only those not yet passed are asked. Those are the indices from
+/// [`topo::SeedProgress::checked_to`] on, and the emptied slots below it that this
+/// edit's window reaches (an index below it that was live then has passed, and an
+/// emptied slot stays empty), so an edit asks its new objects and the window's
+/// growth, not the whole B-rep. A refusal marks nothing.
 fn check_keys_once(
     records: &mut topo::NotifyRecords,
-    id: Vec<u64>,
+    progress: (Vec<u64>, std::sync::Arc<()>),
     serial: Option<u64>,
     b: &Brep,
     key_of: &dyn Fn(EntityRef) -> ObjectRef,
@@ -1118,62 +1153,92 @@ fn check_keys_once(
     let own = |e: EntityRef, key: ObjectKey| {
         !is_reserved_key(key) || serial.is_some_and(|s| topology_entity(s, key) == Some(e))
     };
-    let (_, progress) = records.progress_for(id).ok_or(RESERVED_KEY)?;
-    // (the flags are only set once every index this edit covers has passed)
+    let (_, progress) = records
+        .progress_for(progress.0, progress.1)
+        .ok_or(RESERVED_KEY)?;
+    // (the progress only moves once every index this edit covers has passed)
+    let mut checked_to = progress.checked_to;
     let mut passed: Vec<(usize, usize)> = Vec::new();
-    let mut check = |progress: &topo::SeedProgress, kind: usize, at: usize, e: EntityRef| {
-        let seen = progress.checked.get(kind).and_then(|f| f.get(at)).copied() == Some(true);
-        if seen {
-            return true;
+    let mut skipped: Vec<(usize, usize)> = Vec::new();
+    let kinds = live_counts(b)
+        .into_iter()
+        .zip(slot_counts(b))
+        .zip(checked_to.iter_mut())
+        .enumerate();
+    for (kind, ((count, slots), to)) in kinds {
+        let end = count.saturating_add(window).min(INDEX_END);
+        let ask = |i: usize| {
+            u32::try_from(i).is_ok_and(|index| {
+                let e = kind_entity(kind, index);
+                own(e, key_of(e).key)
+            })
+        };
+        if let Some(unchecked) = progress.unchecked.get(kind) {
+            for &i in unchecked.range(count..end) {
+                if !ask(i) {
+                    return Err(RESERVED_KEY);
+                }
+                passed.push((kind, i));
+            }
         }
-        passed.push((kind, at));
-        own(e, key_of(e).key)
-    };
-    let mut all_own =
-        entities(b).all(|e| entity_slot(e).is_some_and(|(kind, at)| check(progress, kind, at, e)));
-    let live = live_counts(b);
-    for (kind, &count) in live.iter().enumerate() {
-        if !all_own {
-            break;
+        let from = *to;
+        *to = from.max(slots).max(end);
+        for i in from..*to {
+            let covered = (count..end).contains(&i)
+                || u32::try_from(i).is_ok_and(|index| is_live(b, kind, index));
+            if !covered {
+                // (an emptied slot outside the window)
+                skipped.push((kind, i));
+            } else if !ask(i) {
+                return Err(RESERVED_KEY);
+            }
         }
-        all_own = (count..count.saturating_add(window))
-            .map_while(|i| u32::try_from(i).ok())
-            .all(|i| check(progress, kind, i as usize, kind_entity(kind, i)));
     }
-    if !(all_own && own(brep_entity(), p2::brep_ref(b).key)) {
+    if !own(brep_entity(), p2::brep_ref(b).key) {
         return Err(RESERVED_KEY);
     }
-    for (kind, at) in passed {
-        if let Some(flags) = progress.checked.get_mut(kind) {
-            first_visit(flags, at);
+    progress.checked_to = checked_to;
+    for (kind, i) in passed {
+        if let Some(unchecked) = progress.unchecked.get_mut(kind) {
+            unchecked.remove(&i);
+        }
+    }
+    for (kind, i) in skipped {
+        if let Some(unchecked) = progress.unchecked.get_mut(kind) {
+            unchecked.insert(i);
         }
     }
     Ok(())
 }
 
 /// [`seed_records`] of `b` for one edit, giving each live object its record once per
-/// store: records are only removed through [`topo::NotifyRecords`]' own methods,
-/// which forget the progress, so an object seeded under the same [`progress_id`]
-/// still has its record and the store ends exactly as a full seeding leaves it.
+/// store and B-rep value (`progress`, as [`check_keys_once`]): records are only
+/// removed through [`topo::NotifyRecords`]' own methods, which forget the progress,
+/// and a live object below [`topo::SeedProgress::seeded_to`] was live, so seeded,
+/// when the mark was set (arenas only append and empty slots for good). So only the
+/// slots added since are visited, and the store ends exactly as a full seeding leaves
+/// it.
 fn seed_records_once(
     records: &mut topo::NotifyRecords,
-    id: Vec<u64>,
+    progress: (Vec<u64>, std::sync::Arc<()>),
     b: &Brep,
     key_of: &dyn Fn(EntityRef) -> ObjectRef,
 ) -> Result<()> {
     let brep_key = p2::brep_ref(b).key;
-    let (map, progress) = records.progress_for(id).ok_or(RESERVED_KEY)?;
-    for e in entities(b) {
-        let Some((kind, at)) = entity_slot(e) else {
-            continue;
-        };
-        if progress
-            .seeded
-            .get_mut(kind)
-            .is_some_and(|f| first_visit(f, at))
-        {
-            map.entry(key_of(e).key).or_default();
+    let (map, progress) = records
+        .progress_for(progress.0, progress.1)
+        .ok_or(RESERVED_KEY)?;
+    let kinds = slot_counts(b)
+        .into_iter()
+        .zip(progress.seeded_to.iter_mut())
+        .enumerate();
+    for (kind, (slots, seeded_to)) in kinds {
+        for index in (*seeded_to..slots).map_while(|i| u32::try_from(i).ok()) {
+            if is_live(b, kind, index) {
+                map.entry(key_of(kind_entity(kind, index)).key).or_default();
+            }
         }
+        *seeded_to = slots.max(*seeded_to);
     }
     map.entry(brep_key).or_default();
     Ok(())
@@ -1205,9 +1270,11 @@ pub(crate) fn with_lent_context<R>(
 /// kernel key for the edit (`Brep::key` is restored afterwards, whatever the result),
 /// with a default `SmTopology` record for every existing object of `b` from the start
 /// (as every upstream object has one, so a notification sent before any p3 edit runs,
-/// e.g. part 5's edge merge, finds the records it reads) and an empty attribute store
-/// (attribute propagation is not modelled for such callers, nor flags kept between
-/// their edits).
+/// e.g. part 5's edge merge, finds the records it reads) and `b`'s own attributes
+/// ([`Brep::add_attribute`]) under those identities, so the edit's notifications
+/// propagate them as upstream's live on the objects; afterwards `b` gets back the
+/// attributes left on its live objects, whatever the result (flags are not kept
+/// between edits).
 ///
 /// # Errors
 ///
@@ -1225,7 +1292,9 @@ pub(crate) fn kernel_named_edit<R>(
     let mut records = std::mem::take(&mut k.notify_records);
     reseed_records(&mut records, b, &key_of);
     let mut attributes = crate::geom::attribute::AttributeStore::default();
-    let r = {
+    // (not upstream) the B-rep's own attributes, under the edit's identities
+    let seeded = p2::seed_brep_attributes(&mut attributes, b.take_attributes(), &key_of);
+    let r = seeded.and_then(|()| {
         let mut env = NotifyEnv {
             records: &mut records,
             attributes: &mut attributes,
@@ -1233,10 +1302,14 @@ pub(crate) fn kernel_named_edit<R>(
             key_of: &key_of,
         };
         edit(k, b, &mut env)
-    };
+    });
     b.set_key(label);
     k.notify_records = records;
-    r
+    let restored =
+        p2::restore_decoded_attributes(b, attributes, &|key| topology_entity(serial, key));
+    let r = r?;
+    restored?;
+    Ok(r)
 }
 
 /// Runs `edit` for a caller that keeps no notification state of its own (upstream's
@@ -1263,6 +1336,14 @@ pub fn with_kernel_callbacks<R>(
 /// constructor without maps, `bAddAnalytics = FALSE`). `source_key` is the
 /// notification identity of `brep`'s objects (see [`copy_brep`]).
 ///
+/// (not upstream: upstream's attributes live on the objects.) `brep`'s own attributes
+/// ([`Brep::add_attribute`]) go to the copy as the copy's `SM_NO_COPY` notifications
+/// carry them (SMLib's `Copy` handler: copy and reference attributes are passed on,
+/// temporary ones are not); the copy owns the attributes its objects end with, also
+/// those the caller seeded in `env`. `env.attributes` keeps the copy's lists, but not
+/// `brep`'s, which are lent for the copy only (a standalone attribute of `brep`
+/// stays there without users).
+///
 /// # Errors
 ///
 /// `SM_ERR_INVALID_INPUT` for no B-rep; those of [`copy_brep`].
@@ -1279,7 +1360,26 @@ pub fn api_brep_copy(
             entity: None,
         });
     };
-    let mut copy = copy_brep(k, env, brep, source_key, None, None, true, false)?;
+    // (not upstream) lend `brep`'s own attributes to the copy under `source_key`
+    let lent: Vec<(ObjectKey, usize)> = brep
+        .attribute_store()
+        .attributed_objects()
+        .into_iter()
+        .filter_map(crate::topology::loopuse::entity_of_notify_key)
+        .map(|e| {
+            let key = source_key(e).key;
+            (key, env.attributes.attributes(key).len())
+        })
+        .collect();
+    p2::seed_brep_attributes(env.attributes, brep.attribute_store().clone(), source_key)?;
+    let copy = copy_brep(k, env, brep, source_key, None, None, true, false);
+    for (key, before) in lent {
+        for h in env.attributes.attributes(key).into_iter().skip(before) {
+            env.attributes.remove_attribute(key, h, false)?;
+        }
+    }
+    let mut copy = copy?;
+    p2::restore_keyed_attributes(&mut copy, env.attributes, env.key_of)?;
     // (not upstream: the port's cached topology fields, true for the caller)
     copy.refresh_cached_topology();
     Ok(copy)
@@ -1854,8 +1954,14 @@ fn merge_brep_in(
                 orientation,
                 ..crate::topology::Edgeuse::default()
             })?;
-            // (UV trim curve owners are not represented, as `SetUVTrimCurve`)
-            if let Some(c) = uv {
+            // pNewEU->m_pUVTrimCurve = pNewCurve; pNewCurve->SetOwner(pNewEU): the copy's
+            // edge use is named by the caller's key, recorded so trims made later
+            // (`SetUVTrimCurve`) are named alike
+            let eu_owner = (env.key_of)(EntityRef::Edgeuse(new_eu));
+            b.geometry_owner_keys
+                .insert(EntityRef::Edgeuse(new_eu), eu_owner);
+            if let Some(mut c) = uv {
+                let _ = c.set_owner(Some(eu_owner), None);
                 b.edgeuse_mut(new_eu)?.uv_trim_curve = Some(c);
             }
 
@@ -2379,6 +2485,7 @@ fn delete_face_in(
 
         // Remove and Delete the DelRegion
         ignore_soft(b.remove_region_from_list(del_region))?;
+        b.remove_region_record(del_region)?;
     }
 
     let mut new_wire_edges: Vec<EdgeId> = Vec::new();
@@ -2401,6 +2508,8 @@ fn delete_face_in(
             // Remove vertexuses from the vertex.
             vertex_remove_vertexuse(b, v, other_vu)?;
             vertex_remove_vertexuse(b, v, vu)?;
+            // delete pOtherVU
+            b.remove_vertexuse_record(other_vu)?;
             if n_vus == 2 {
                 // If there were only two VU - convert vertex to a shell vertex
                 let new_s = b.add_shell_record(crate::topology::Shell::default())?;
@@ -2416,6 +2525,11 @@ fn delete_face_in(
 
                 // count the number of shell vertics made
                 new_shell_vertex_count += 1;
+            } else {
+                // vertex was attached to this face and through other vertexuses to
+                // other wires or other faces - just delete VU and straighten out the
+                // rest later.
+                b.remove_vertexuse_record(vu)?;
             }
         } else {
             for eu in lu1::edgeuses(b, lu, None, None)? {
@@ -2463,6 +2577,9 @@ fn delete_face_in(
                     if any_edgeuse == Some(eu) {
                         any_edgeuse = None;
                     }
+                    // delete pVU1; delete pVU2
+                    b.remove_vertexuse_record(vu1)?;
+                    b.remove_vertexuse_record(vu2)?;
                 }
             }
         }
@@ -2476,6 +2593,12 @@ fn delete_face_in(
         faceuse_remove_loopuse(b, lfu, lu)?;
         let ofu = lu1::faceuse(b, other_lu)?.ok_or(null_deref("loop use without face use"))?;
         faceuse_remove_loopuse(b, ofu, other_lu)?;
+        // delete pL; delete pLU; delete pOtherLU
+        if let Some(l) = l {
+            b.remove_loop_record(l)?;
+        }
+        b.remove_loopuse_record(lu)?;
+        b.remove_loopuse_record(other_lu)?;
     }
 
     // Take care of face and faceuses - remove from lists
@@ -2493,6 +2616,8 @@ fn delete_face_in(
 
     // delete pFU; delete pOtherFU
     delete_faceuses(b, [fu, other_fu])?;
+    b.remove_faceuse_record(fu)?;
+    b.remove_faceuse_record(other_fu)?;
 
     if do_region_nesting {
         // If there are no vertices and no edges then the entire shell goes away.
@@ -2743,7 +2868,8 @@ fn delete_face_nesting(
     shell::destroy(k, b, last, env)
 }
 
-/// `delete pFU` for each face use (the arena keeps the record): `SmTopology`'s destructor
+/// The unlinking part of `delete pFU` for each face use (the caller then removes the
+/// records): `SmTopology`'s destructor
 /// removes a member still in its owner's list (`m_pListOwner->Remove(this)`, status
 /// ignored). After region nesting merged the two shells, the mate face use is in the
 /// surviving shell, which upstream's explicit `Remove`s no longer reach.
@@ -3374,6 +3500,9 @@ fn squeeze_edge_in(
         let v = vertexuse::vertex(b, vu)?.ok_or(null_deref("vertex use without vertex"))?;
         edge_remove_edgeuse(b, e, eu)?;
         vertex_remove_vertexuse(b, v, vu)?;
+        // delete pEU; delete pVU
+        b.remove_edgeuse_record(eu)?;
+        b.remove_vertexuse_record(vu)?;
     }
 
     // inform public two vertices are being merged into one
@@ -3428,7 +3557,10 @@ fn squeeze_edge_in(
         b.edge_mut(e)?.curve = None;
         b.set_geometry_owner_key(EntityRef::Edge(e), None);
     }
-    b.remove_from_edge_list(e);
+    // delete pDelVertex; delete pEdgeToSqueeze (the vertex's record goes last, after
+    // the edge's destruction notification that still names it)
+    b.remove_edge_record(e)?;
+    b.remove_vertex_record(del_vertex)?;
     Ok(())
 }
 
@@ -3499,7 +3631,7 @@ fn squeeze_loops(
 /// # Errors
 ///
 /// [`SolidError::Unported`] from a surface of revolution's `MakeNurb`.
-fn with_nurb<'a>(k: &Kernel, s: &'a Surface) -> Result<Option<Cow<'a, BSplineSurface>>> {
+pub(crate) fn with_nurb<'a>(k: &Kernel, s: &'a Surface) -> Result<Option<Cow<'a, BSplineSurface>>> {
     // a cone, sphere, torus or surface of revolution makes its NURB on the surface and
     // keeps it (`Surface::kind_with_nurb`, status ignored)
     if let Some(base) = s.revolution_base_with_nurb(k)? {
@@ -5308,6 +5440,80 @@ mod tests {
             })
             .count();
         assert!(edge_merges >= 1);
+    }
+
+    /// One edit's [`check_keys_once`] and [`seed_records_once`] of `b` into `records`,
+    /// asserting they decide and seed as the full walks ([`check_keys`],
+    /// [`seed_records`] into `full`).
+    fn edit_once(
+        b: &mut Brep,
+        key_of: &dyn Fn(EntityRef) -> ObjectRef,
+        records: &mut topo::NotifyRecords,
+        full: &mut topo::NotifyRecords,
+    ) -> Result<()> {
+        let window = allocation_window(b, None, 0);
+        let expected = check_keys(&Context::default(), b, key_of, window);
+        let id = progress_id(b, None, key_of);
+        let instance = b.progress_tag();
+        let progress = (id.clone(), std::sync::Arc::clone(&instance));
+        let checked = check_keys_once(records, progress, None, b, key_of, window);
+        assert_eq!(checked, expected);
+        checked?;
+        seed_records_once(records, (id, instance), b, key_of)?;
+        seed_records(full, b, key_of);
+        assert_eq!(*records, *full);
+        Ok(())
+    }
+
+    /// The per-edit check and seeding only visit the slots added since the last edit
+    /// of the same B-rep value (and the emptied slots a window reaches again), yet
+    /// decide and seed exactly as the full walks: through removals and additions,
+    /// after a record leaves the store, and on a clone (another value under the same
+    /// identity, whose objects the first value's progress says nothing about).
+    #[test]
+    fn incremental_check_and_seeding_match_the_full_walks() {
+        let mut b = Brep::default();
+        let vs: Vec<VertexId> = (0..4)
+            .map(|i| b.add_vertex(Point3::new(f64::from(i), 0.0, 0.0)).unwrap())
+            .collect();
+        // (vertex 0 takes a reserved key: refused while it is live or in a window)
+        let reserved = EntityRef::Vertex(vs[0]);
+        let key_of = move |e: EntityRef| ObjectRef {
+            key: if e == reserved {
+                ObjectKey(crate::geom::context::GEOMETRY_KEY_BASE | 1)
+            } else {
+                dest_key(e).key
+            },
+            ..dest_key(e)
+        };
+        let mut records = topo::NotifyRecords::new();
+        let mut full = topo::NotifyRecords::new();
+        let mut copy = b.clone();
+        b.remove_vertex_record(vs[0]).unwrap();
+        b.remove_vertex_record(vs[1]).unwrap();
+        edit_once(&mut b, &key_of, &mut records, &mut full).unwrap();
+        b.add_vertex(Point3::ZERO).unwrap();
+        edit_once(&mut b, &key_of, &mut records, &mut full).unwrap();
+        let key = dest_key(EntityRef::Vertex(vs[2])).key;
+        records.remove(&key);
+        full.remove(&key);
+        edit_once(&mut b, &key_of, &mut records, &mut full).unwrap();
+        // the clone still has vertex 0, and vertex 1, which `b` lost before its edits
+        assert_eq!(
+            edit_once(&mut copy, &key_of, &mut records, &mut full),
+            Err(RESERVED_KEY)
+        );
+        copy.remove_vertex_record(vs[0]).unwrap();
+        edit_once(&mut copy, &key_of, &mut records, &mut full).unwrap();
+        assert!(records.contains_key(&dest_key(EntityRef::Vertex(vs[1])).key));
+        // a window that reaches vertex 0's emptied slot again refuses it
+        for v in b.vertices().ids().collect::<Vec<_>>() {
+            b.remove_vertex_record(v).unwrap();
+        }
+        assert_eq!(
+            edit_once(&mut b, &key_of, &mut records, &mut full),
+            Err(RESERVED_KEY)
+        );
     }
 }
 

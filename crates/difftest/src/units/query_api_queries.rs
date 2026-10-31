@@ -46,6 +46,11 @@ struct Inputs {
     other_box: Option<[f64; 4]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_relationship: Option<i32>,
+    /// Rust side only (op 19): the solve over a bare [`LiveBrepObjects`], as a library
+    /// caller makes it (no B-rep cache, no `face_entity`), not this runner's [`Objects`]
+    /// adapter. The C++ side is the same `SmApiFaceClosestPoint`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    live: bool,
 }
 
 fn v(a: [f64; 3]) -> Vec3 {
@@ -64,7 +69,7 @@ fn cclosest(o: &mut Vec<f64>, p: api::CurveClosestPoint) {
 }
 fn status(e: &SolidError) -> f64 {
     match e {
-        SolidError::InvalidInput { .. } => 1007.,
+        SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. } => 1007.,
         SolidError::Upstream { code, .. } => f64::from(*code),
         _ => -1.,
     }
@@ -76,11 +81,11 @@ fn output(op: i32, r: Result<Vec<f64>>) -> Output {
     }
 }
 
-/// The case ops are `1..=25`; the FFI's `0` and `26` are the graph exports
+/// The case ops are `1..=25` and `27` (`SmApiBrepMaterialCensus`); the FFI's `0` and `26` are the graph exports
 /// [`imported`] reads the native B-rep through, which have no Rust counterpart to
 /// compare.
 fn compared_op(op: i32) -> std::result::Result<(), HarnessError> {
-    if (1..=25).contains(&op) {
+    if (1..=25).contains(&op) || op == 27 {
         Ok(())
     } else {
         Err(HarnessError::new(format!("op {op} is not a compared query (1..=25)")))
@@ -94,7 +99,7 @@ fn decode(op: i32, values: Vec<f64>) -> Output {
     let mut floats = Vec::new();
     for (i, value) in values.into_iter().enumerate() {
         let integer = i == 0
-            || matches!(op, 9 | 10 | 11 | 13 | 14 | 18 | 23)
+            || matches!(op, 9 | 10 | 11 | 13 | 14 | 18 | 23 | 27)
             || matches!(op, 2 | 6 | 12) && i == 1
             || op == 3 && i == 5
             || op == 7 && i == 2;
@@ -369,6 +374,29 @@ fn own_brep(
             a[6],
             a[6],
         )
+    } else if (14..=16).contains(&kind) {
+        use solidcore::boolean::api_brep as bo;
+        let origin = v([a[0], a[1], a[2]]);
+        let first = solidcore::primitive::api_primitives::create_box(k, origin, a[6], a[6], a[6]);
+        let (at, size) = if kind == 15 {
+            (v([a[0] + 2. * a[6], a[1], a[2]]), a[6])
+        } else {
+            (
+                v([a[0] + 0.25 * a[6], a[1] + 0.25 * a[6], a[2] + 0.25 * a[6]]),
+                0.5 * a[6],
+            )
+        };
+        match first {
+            Ok(outer) => solidcore::primitive::api_primitives::create_box(k, at, size, size, size)
+                .and_then(|inner| {
+                    if kind == 14 {
+                        bo::boolean_difference(k, outer, inner)
+                    } else {
+                        bo::boolean_merge(k, outer, inner)
+                    }
+                }),
+            Err(e) => Err(e),
+        }
     } else if kind == 12 {
         // two real closed curve loops: an outer square and a square hole
         const XY: [[f64; 2]; 8] = [
@@ -856,18 +884,35 @@ fn topology(k: &mut Kernel, i: &Inputs, b: &mut Brep, second: &mut Brep) -> Resu
                 &[],
             )?;
             let identities = identities();
-            let mut empty = Brep::new();
-            let objects = Objects::new(k, [&mut *b, &mut empty], &identities)?;
-            closest(
-                &mut o,
-                api::face_closest_point_in_shape(
-                    k,
-                    &shape,
-                    &objects,
-                    (BrepId::from_index(0), face),
-                    point,
-                )?,
-            );
+            if i.live {
+                // the library path: a bare live view of the B-rep, its geometry named by
+                // its owners' arena identities (`own_brep`)
+                let [identity, _] = &identities;
+                let objects = LiveBrepObjects::new(b, identity, None)?;
+                closest(
+                    &mut o,
+                    api::face_closest_point_in_shape(
+                        k,
+                        &shape,
+                        &objects,
+                        (BrepId::from_index(0), face),
+                        point,
+                    )?,
+                );
+            } else {
+                let mut empty = Brep::new();
+                let objects = Objects::new(k, [&mut *b, &mut empty], &identities)?;
+                closest(
+                    &mut o,
+                    api::face_closest_point_in_shape(
+                        k,
+                        &shape,
+                        &objects,
+                        (BrepId::from_index(0), face),
+                        point,
+                    )?,
+                );
+            }
         }
         21 => cclosest(
             &mut o,
@@ -881,6 +926,22 @@ fn topology(k: &mut Kernel, i: &Inputs, b: &mut Brep, second: &mut Brep) -> Resu
             api::edge_classify_parameter(k, b, e.ok_or_else(missing)?, a[14])?.code(),
         )),
         24 => vec(&mut o, api::edge_tangent(k, b, e.ok_or_else(missing)?, a[14])?),
+        27 => {
+            if a[18] != 0. {
+                // the shim's rewrite of the void flags along the region list
+                let ids = solidcore::topology::brep::p1::regions(b, None)?;
+                for (n, id) in ids.into_iter().enumerate() {
+                    let flag = match (n + index) % 3 {
+                        0 => 0,
+                        1 => 1,
+                        _ => solidcore::topology::brep_data::UNSURE,
+                    };
+                    b.region_mut(id)?.set_is_void(flag);
+                }
+            }
+            let (solids, voids) = api::brep_material_census(b)?;
+            o.extend([solids as f64, voids as f64]);
+        }
         25 => vec(&mut o, api::vertex_get_point(b, vert.ok_or_else(missing)?)?),
         _ => return Err(missing()),
     }
@@ -1016,6 +1077,7 @@ impl UnitDiff for Runner {
             data: a,
             other_box: None,
             expected_relationship: None,
+            live: false,
         })
         .ok()
     }

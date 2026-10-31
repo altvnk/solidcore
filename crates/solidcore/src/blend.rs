@@ -11,6 +11,8 @@ pub mod fillet_custom_solver;
 pub mod fillet_executive;
 pub mod fillet_geom;
 pub mod fillet_intersector;
+pub mod fillet_removal;
 pub mod fillet_solver;
 pub mod fillet_standard_solver;
 pub mod hcr;
+pub mod identify_fillet;

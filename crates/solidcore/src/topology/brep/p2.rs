@@ -56,8 +56,13 @@
 //!   records to the arenas as they link them, not all up front; `MakeEdgeTopology`'s
 //!   `TransferChildrenTo` (the one shell call that can fail) runs before any new record
 //!   exists, so upstream's `SmObjDelete` guards have nothing to undo. The merged end
-//!   shell is deleted ([`shell::destroy`]); a deleted vertex shell's vertex use stays in
-//!   the arena, unlinked.
+//!   shell is deleted ([`shell::destroy`]), and a vertex shell's vertex use is deleted
+//!   with its record (`delete pVU`).
+//! - Opt-in (WR-585, fork tangency-labs/smlib@be8ac73):
+//!   [`UpstreamFixes::boolean_wire_edge_keeps_faceuse_shell`](crate::kernel::UpstreamFixes::boolean_wire_edge_keeps_faceuse_shell)
+//!   makes `MakeEdgeTopology`, joining a wire start shell to a faceuse end shell, move
+//!   the wires into the faceuse shell, put it in the wire shell's place in the region
+//!   and delete the wire shell, instead of moving every face use into the wire shell.
 //! - `MateLaminaEdgeToSurface` checks for the face's surface before the neighbour
 //!   (lamina / seam) checks; upstream binds the surface only for `IsSeam`, so a face
 //!   without surface there ends in the distance loop instead of
@@ -716,7 +721,7 @@ pub fn region_only_key(e: EntityRef) -> ObjectRef {
 pub struct RegionNotifyState {
     /// The regions' `SmTopology` records.
     pub records: crate::topology::topology::NotifyRecords,
-    /// The (empty) attribute store.
+    /// The attribute store (empty, or the edited B-rep's own attributes).
     pub attributes: AttributeStore,
 }
 
@@ -756,8 +761,8 @@ impl RegionNotifyState {
 /// without a notification environment, the heal path, `CopyEdges`). Upstream every object
 /// carries its `SmTopology` part and attributes; such a caller models neither, so the
 /// notification runs on a default record for every object of the B-rep, keyed by its
-/// arena identity (`loopuse::notify_ref`), and an
-/// empty attribute store. The records are never read back: they exist so that
+/// arena identity (`loopuse::notify_ref`), and an attribute store that is empty, or
+/// holds the B-rep's own attributes for the edit ([`Self::with_attributes_of`]). The records are never read back: they exist so that
 /// `SmTopology::Notify`'s flag propagation finds both objects, as upstream it always does.
 /// The identities are unique within one B-rep only.
 #[derive(Debug, Default)]
@@ -805,6 +810,31 @@ impl ArenaNotifyState {
         }
     }
 
+    /// [`Self::new`] holding `b`'s own attributes ([`Brep::add_attribute`], keyed by the
+    /// same arena identities), so the edit's notifications propagate them with SMLib's
+    /// handlers, as upstream's live on the objects the edit changes. `b` holds none
+    /// until [`Self::restore_attributes`] gives them back. Only for an edit of `b`
+    /// alone: a second B-rep [`Self::seed`]ed in shares its identities.
+    pub(crate) fn with_attributes_of(b: &mut Brep) -> Self {
+        let mut state = Self::new(b);
+        state.attributes = b.take_attributes();
+        state
+    }
+
+    /// Gives `b` the attributes this state's notifications left on its live objects
+    /// (pair of [`Self::with_attributes_of`]); the lists of objects the edit deleted
+    /// are cleared, as upstream's destructors do.
+    ///
+    /// # Errors
+    /// None in practice.
+    pub(crate) fn restore_attributes(&mut self, b: &mut Brep) -> Result<()> {
+        restore_decoded_attributes(
+            b,
+            core::mem::take(&mut self.attributes),
+            &crate::topology::loopuse::entity_of_notify_key,
+        )
+    }
+
     /// The [`NotifyEnv`] over this state, notifying through `context` (the kernel's,
     /// when the caller holds it mutably: its notify callbacks see the events, as upstream
     /// the B-rep's context's do).
@@ -819,6 +849,91 @@ impl ArenaNotifyState {
             key_of: &crate::topology::loopuse::notify_ref,
         }
     }
+}
+
+/// (not upstream: upstream attributes live on the objects.) Moves `source`, a B-rep's
+/// own attribute store (keyed by [`crate::topology::loopuse::notify_ref`]), into an
+/// operation's `store` under that operation's identities `key_of` of the same objects.
+///
+/// # Errors
+/// [`SolidError::InvalidInput`] for a list whose key names no object; a store that
+/// cannot grow.
+pub(crate) fn seed_brep_attributes(
+    store: &mut AttributeStore,
+    source: AttributeStore,
+    key_of: &dyn Fn(EntityRef) -> ObjectRef,
+) -> Result<()> {
+    store.absorb(source, &|key| {
+        crate::topology::loopuse::entity_of_notify_key(key)
+            .map(|e| key_of(e).key)
+            .ok_or(SolidError::invalid_input(
+                "topology::brep::p2::seed_brep_attributes",
+                "attribute list names no object",
+            ))
+    })
+}
+
+/// (not upstream) Ends an operation's naming of `b`: `b`'s own attributes become the
+/// lists `store` holds for its live objects, named by `decode` (an operation identity
+/// to the entity it names); every other list is cleared, as upstream's object
+/// destructor does ([`AttributeStore::retain_rekeyed`]).
+///
+/// # Errors
+/// None in practice.
+pub(crate) fn restore_decoded_attributes(
+    b: &mut Brep,
+    mut store: AttributeStore,
+    decode: &dyn Fn(ObjectKey) -> Option<EntityRef>,
+) -> Result<()> {
+    if !store.attributed_objects().is_empty() {
+        let live = &*b;
+        let listed = live.listed_entities();
+        store.retain_rekeyed(&|key| {
+            decode(key)
+                .filter(|&e| live.still_has(&listed, e))
+                .map(|e| crate::topology::loopuse::notify_ref(e).key)
+        })?;
+    }
+    b.set_attributes(store);
+    Ok(())
+}
+
+/// [`restore_decoded_attributes`] for identities `key_of` without a decoder: `b`'s
+/// live objects are named by `key_of` and given the lists `store` holds for them;
+/// `store` itself is left as it is.
+///
+/// # Errors
+/// None in practice.
+pub(crate) fn restore_keyed_attributes(
+    b: &mut Brep,
+    store: &AttributeStore,
+    key_of: &dyn Fn(EntityRef) -> ObjectRef,
+) -> Result<()> {
+    if store.attributed_objects().is_empty() {
+        b.set_attributes(AttributeStore::default());
+        return Ok(());
+    }
+    let names: BTreeMap<ObjectKey, EntityRef> = live_entities(b)
+        .into_iter()
+        .map(|e| (key_of(e).key, e))
+        .collect();
+    restore_decoded_attributes(b, store.clone(), &|key| names.get(&key).copied())
+}
+
+/// Every live object of `b` that can carry attributes (all but the B-rep itself).
+fn live_entities(b: &Brep) -> Vec<EntityRef> {
+    let mut all = Vec::new();
+    all.extend(b.regions().iter().map(|(x, _)| EntityRef::Region(x)));
+    all.extend(b.shells().iter().map(|(x, _)| EntityRef::Shell(x)));
+    all.extend(b.faceuses().iter().map(|(x, _)| EntityRef::Faceuse(x)));
+    all.extend(b.faces().iter().map(|(x, _)| EntityRef::Face(x)));
+    all.extend(b.loopuses().iter().map(|(x, _)| EntityRef::Loopuse(x)));
+    all.extend(b.loops().iter().map(|(x, _)| EntityRef::Loop(x)));
+    all.extend(b.edgeuses().iter().map(|(x, _)| EntityRef::Edgeuse(x)));
+    all.extend(b.edges().iter().map(|(x, _)| EntityRef::Edge(x)));
+    all.extend(b.vertexuses().iter().map(|(x, _)| EntityRef::Vertexuse(x)));
+    all.extend(b.vertices().iter().map(|(x, _)| EntityRef::Vertex(x)));
+    all
 }
 
 /// The identities a rebuilt cache keys its edge/face owners by.
@@ -1601,8 +1716,16 @@ pub fn replace_surface(
     };
     // calls SmFace::Notify(SM_NO_CHANGE_GEOMETRY, ..) which tells all Face SmEdgeuses
     // and SmVertexuses to delete all their cached data
-    let old_surface =
-        face1::set_surface_notified(b, env, top_face, face_ref, new_surface, false, surface_refs)?;
+    let old_surface = face1::set_surface_notified(
+        k,
+        b,
+        env,
+        top_face,
+        face_ref,
+        new_surface,
+        false,
+        surface_refs,
+    )?;
 
     // default faceDomain to NewSurface Domain
     face2::set_uv_domain(b, top_face, &new_domain)?;
@@ -1757,7 +1880,7 @@ fn attach_wire_edge(b: &mut Brep, s: ShellId, e: EdgeId, eu: EdgeuseId) -> Resul
     // If start shell was shell vertex make it a wire edge with pointer to newE.
     if shell_is_vertex_shell(b, s)? {
         let vu = shell_vertexuse(b, s)?;
-        remove_vertexuse_from_vertex(b, vu)?;
+        delete_vertexuse(b, vu)?;
         shell_set_wire_edgeuse(b, s, eu)?;
     }
 
@@ -1768,14 +1891,15 @@ fn attach_wire_edge(b: &mut Brep, s: ShellId, e: EdgeId, eu: EdgeuseId) -> Resul
     Ok(())
 }
 
-/// Removes vertex use `vu` from its vertex's list (`pVU->GetVertex()->Remove(pVU)`;
-/// the record stays in the arena, unreachable, as upstream deletes it).
-fn remove_vertexuse_from_vertex(b: &mut Brep, vu: VertexuseId) -> Result<()> {
+/// Removes vertex use `vu` from its vertex's list and deletes it
+/// (`pVU->GetVertex()->Remove(pVU)`, `delete pVU`: its record leaves the arena).
+fn delete_vertexuse(b: &mut Brep, vu: VertexuseId) -> Result<()> {
     let v = b
         .vertexuse(vu)?
         .vertex
         .ok_or(null_deref("vertex use without vertex"))?;
     b.vertex_mut(v)?.vertexuses.retain(|&x| x != vu);
+    b.remove_vertexuse_record(vu)?;
     Ok(())
 }
 
@@ -1849,16 +1973,34 @@ pub fn make_edge_topology(
     }
 
     if start_shell != end_shell {
+        let mut remove_end = true;
         if shell_is_vertex_shell(b, end_shell)? {
             let vu = shell_vertexuse(b, end_shell)?;
-            remove_vertexuse_from_vertex(b, vu)?;
+            delete_vertexuse(b, vu)?;
             shell_clear_members(b, end_shell)?;
+        } else if k.fixes.boolean_wire_edge_keeps_faceuse_shell
+            && b.shell(start_shell)?.is_wire_shell()
+            && b.shell(end_shell)?.is_faceuse_shell()
+        {
+            // WR-585 (opt-in, fork tangency-labs/smlib@be8ac73): the faceuse shell takes
+            // the wire shell's wires and its place in the region, and the wire shell
+            // goes, instead of moving every face use into the wire shell.
+            let reg = shell_region(b, start_shell)?.ok_or(null_deref("shell without region"))?;
+            shell_transfer_children(k, b, start_shell, end_shell)?;
+            shell::region_remove_shell(b, reg, end_shell)?;
+            region_insert_shell_after(b, reg, end_shell, start_shell)?;
+            shell::region_remove_shell(b, reg, start_shell)?;
+            shell::destroy(k, b, start_shell, env)?;
+            start_shell = end_shell;
+            remove_end = false;
         } else {
             shell_transfer_children(k, b, end_shell, start_shell)?;
         }
-        region_remove_shell(b, end_shell)?;
-        // delete pEndShell (SmBrep.cpp:13724): ~SmShell, ported as shell::destroy
-        shell::destroy(k, b, end_shell, env)?;
+        if remove_end {
+            region_remove_shell(b, end_shell)?;
+            // delete pEndShell (SmBrep.cpp:13724): ~SmShell, ported as shell::destroy
+            shell::destroy(k, b, end_shell, env)?;
+        }
     }
 
     let (e, eu) = link_new_wire_edge(b, start, end)?;
@@ -1911,6 +2053,27 @@ fn region_post_insert_shell(b: &mut Brep, r: RegionId, s: ShellId) -> Result<()>
     Ok(())
 }
 
+/// `pRegion->InsertAfter(pShell, pAfter)` (`SmOwningTopology::InsertAfter`): puts
+/// `s` into the region's shell list just after `after` and makes the region its owner
+/// (WR-585's opt-in only; not in the pinned upstream's `MakeEdgeTopology`).
+///
+/// # Errors
+/// `InvalidInput` when `after` is not in the region's list, and dangling ids.
+fn region_insert_shell_after(b: &mut Brep, r: RegionId, s: ShellId, after: ShellId) -> Result<()> {
+    b.shell(s)?;
+    let list = &mut b.region_mut(r)?.shells;
+    let at = list
+        .iter()
+        .position(|&x| x == after)
+        .ok_or(SolidError::invalid_input(
+            OP,
+            "shell to insert after is not in the region",
+        ))?;
+    list.insert(at + 1, s);
+    b.shell_mut(s)?.region = Some(r);
+    Ok(())
+}
+
 /// `pShell->GetRegion()->Remove(pShell)` ([`shell::region_remove_shell`]); the status
 /// is ignored upstream, so a shell missing from its region's list (`SM_ERR`, the
 /// port's [`SolidError::InvalidInput`]) goes on. A shell without region is a null
@@ -1918,7 +2081,7 @@ fn region_post_insert_shell(b: &mut Brep, r: RegionId, s: ShellId) -> Result<()>
 fn region_remove_shell(b: &mut Brep, s: ShellId) -> Result<()> {
     let r = shell_region(b, s)?.ok_or(null_deref("shell without region"))?;
     match shell::region_remove_shell(b, r, s) {
-        Err(SolidError::InvalidInput { .. }) | Ok(()) => Ok(()),
+        Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) | Ok(()) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -2016,7 +2179,8 @@ pub struct MergedCurves {
 }
 
 /// `MergeCurvesOnSurface`: merges the 3D `curves` (with optional UV curves
-/// `uv_curves`, used on the first face only) lying on the surface of `face` into the
+/// `uv_curves`, one entry per curve, `None` for upstream's null entry; used on the first
+/// face only) lying on the surface of `face` into the
 /// face, splitting it (and the faces split off it) into new faces. Curves shorter than
 /// `tolerance` are skipped. Each curve is classified against each face
 /// in place ([`curve_on_classify_mut`]), coincident-maybe intervals are squeezed, the
@@ -2040,7 +2204,7 @@ pub fn merge_curves_on_surface<O: ClassObject + Copy>(
     face: FaceId,
     tolerance: f64,
     curves: &[O],
-    uv_curves: Option<&[O]>,
+    uv_curves: Option<&[Option<O>]>,
     options: MergeCurvesOptions<O>,
 ) -> Result<MergedCurves> {
     // check state - m_bEditingEnabled must be on
@@ -2062,7 +2226,7 @@ fn merge_curves_body<O: ClassObject + Copy>(
     face: FaceId,
     tolerance: f64,
     curves: &[O],
-    uv_curves: Option<&[O]>,
+    uv_curves: Option<&[Option<O>]>,
     options: MergeCurvesOptions<O>,
 ) -> Result<MergedCurves> {
     let mut out = MergedCurves::default();
@@ -2090,7 +2254,7 @@ fn merge_curves_body<O: ClassObject + Copy>(
 
             // on first face iter - get UVCurve if given
             let uv_curve = match (uv_curves, jj) {
-                (Some(uv), 0) => Some(*uv.get(ii).ok_or(null_deref("missing UV curve"))?),
+                (Some(uv), 0) => *uv.get(ii).ok_or(null_deref("missing UV curve"))?,
                 _ => None,
             };
 
@@ -2859,7 +3023,8 @@ mod tests {
     }
 
     /// `MakeEdgeTopology` between two shell vertices deletes the end vertex shell
-    /// (`delete pEndShell`): the region keeps one wire shell and the arena no orphan.
+    /// (`delete pEndShell`) and both shell vertex uses (`delete pVU`): the region keeps
+    /// one wire shell and the arenas no orphan (the edge's two vertex uses remain).
     #[test]
     fn edge_between_shell_vertices_deletes_the_merged_shell() {
         let mut k = Kernel::default();
@@ -2874,6 +3039,7 @@ mod tests {
         assert!(b.shell(end_shell).is_err());
         let region = b.infinite_region().unwrap();
         assert_eq!(b.region(region).unwrap().shells.len(), 1);
+        assert_eq!(b.vertexuses().len(), 2);
     }
 
     fn solution(objects: &[CacheObject], params: &[f64]) -> Solution<CacheObject> {

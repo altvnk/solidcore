@@ -618,7 +618,8 @@ impl<O: Copy + PartialEq> CurveCache<O> {
             }
             CurveKind::Ellipse(e) => {
                 if e.base().gw_nurb().is_none() {
-                    e.make_nurb_owned(k, owner)?;
+                    // m_crCurve's GetEdge(): the edge whose tolerance the builder gave
+                    e.make_nurb_owned_with_edge_tol(k, owner, self.owner_zone_tol_3d)?;
                 }
                 true
             }
@@ -1399,6 +1400,7 @@ pub fn compute_constants(
 
     let mut efo = FindCurveDistanceExtrema::new(k, bez, original, interval, 10.0 * EFF_ZERO);
     let mut solver = LocalSolve1d::with_interval(interval, false);
+    solver.set_failed_guess_no_sign_change(k.fixes.oscillating_skips_failed_guesses);
 
     // Step along the curve: when the function changes sign, call the local solver.
     let num_steps = 20u32;
