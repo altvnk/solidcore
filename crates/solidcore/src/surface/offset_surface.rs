@@ -2937,8 +2937,8 @@ mod tests {
         for i in 0..3 {
             let mut row = Vec::new();
             for j in 0..3 {
-                let fi = i as f64 / 2.0;
-                let fj = j as f64 / 2.0;
+                let fi = f64::from(i) / 2.0;
+                let fj = f64::from(j) / 2.0;
                 let x = fi + if i == 2 { fj } else { 0.0 };
                 let y = fj + if j == 2 { fi } else { 0.0 };
                 row.push(CPoint::new(x, y, fi * fj, NOW));
