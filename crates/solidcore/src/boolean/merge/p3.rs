@@ -756,7 +756,7 @@ fn source_ref(e: EntityRef) -> crate::geom::object::ObjectRef {
 /// no context), as the arena entry's component copies do. (not upstream) The store holds
 /// the source's own attributes under [`source_ref`], so the copy's `SM_NO_COPY`
 /// notifications give the copy's objects theirs; the copy keeps them.
-fn copy_brep(
+pub(crate) fn copy_brep(
     k: &mut Kernel,
     source: &Brep,
     copy_map: Option<&mut CopyBrepMap<EntityRef>>,
@@ -787,7 +787,7 @@ fn copy_brep(
 
 /// `SmBrep::MergeBrep(source, pOptCopyBrepMap, pOptReverseMap, bAddAnalytics)`
 /// (`topology::brep::p3::merge_brep`), notifying as [`copy_brep`].
-fn combine_brep(
+pub(crate) fn combine_brep(
     k: &mut Kernel,
     target: &mut Brep,
     source: &Brep,
@@ -996,7 +996,10 @@ fn list_operand(k: &mut Kernel, breps: &[Brep], surfaces: &[Surface]) -> Result<
         let mut result = copy_brep(k, first, None, None, true, true)?;
         for source in rest {
             // MergeBrep's ordinary status is ignored upstream.
-            ignored(combine_brep(k, &mut result, source, None, None, true))?;
+            ignored(crate::error::passed_on(
+                combine_brep(k, &mut result, source, None, None, true),
+                k.fixes.brep_edit_statuses_pass_on,
+            )?)?;
         }
         (result, false)
     } else {
@@ -1233,14 +1236,26 @@ pub fn boolean_lists_with_notifications(
                         // Defaults: pOptNewFaces=NULL, bUseMerge=TRUE,
                         // pOptMergeObject=NULL. Returned outputs are not inspected.
                         if let Some(notify) = notifications.as_deref_mut() {
-                            bp7::copy_faces(
+                            // (not upstream: upstream's objects are their own
+                            // identities) the result under the caller's names, the
+                            // component's objects under their own (`notify_ref`, its
+                            // faces `face_ref`), as `copy_component` names them
+                            let source_key = notify.key_of;
+                            let mut component_env = crate::topology::edge::NotifyEnv {
+                                records: &mut *notify.records,
+                                attributes: &mut *notify.attributes,
+                                context: notify.context.as_deref_mut(),
+                                key_of: &crate::topology::loopuse::notify_ref,
+                            };
+                            bp7::copy_faces_from(
                                 k,
                                 &mut result,
                                 &connected,
                                 &mut component,
                                 true,
+                                source_key,
                                 &face_ref,
-                                notify,
+                                &mut component_env,
                             )?;
                         } else {
                             // the arena entry keeps no notification state: the copy
@@ -1254,17 +1269,16 @@ pub fn boolean_lists_with_notifications(
                             // reference attribute) and the result keeps its own.
                             copy_component(k, &mut result, &connected, &mut component, &face_ref)?;
                         }
-                        ignored(stitch_and_orient(
-                            k,
-                            &mut component,
-                            -0.1,
-                            false,
-                            None,
-                            None,
-                        ))?;
+                        ignored(crate::error::passed_on(
+                            stitch_and_orient(k, &mut component, -0.1, false, None, None),
+                            k.fixes.brep_edit_statuses_pass_on,
+                        )?)?;
                         output.breps.push(component);
                         result.set_editing_enabled(true);
-                        ignored(remove_faces(k, &mut result, &connected))?;
+                        ignored(crate::error::passed_on(
+                            remove_faces(k, &mut result, &connected),
+                            k.fixes.brep_edit_statuses_pass_on,
+                        )?)?;
                         let next = bp::faces(&result, None)?;
                         if next.len() >= faces.len() {
                             return Err(SolidError::invalid_input(

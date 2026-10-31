@@ -1142,6 +1142,57 @@ fn body_attributes(
     Ok(store)
 }
 
+/// (not upstream) Whether `a` is an application attribute (`SM_AI_USER_1` and up), not
+/// one of the kernel's own ids, which the session's executive keeps and finds by handle.
+fn is_application_attribute(a: &Attribute) -> bool {
+    a.attribute_id() >= ids::USER_1
+}
+
+/// (not upstream) [`body_attributes`] of `body`'s application attributes alone
+/// ([`is_application_attribute`]): what an operation that consumes and rebuilds `body`
+/// (the cliff overflow's Boolean) carries on its objects, as upstream's live on them.
+fn body_application_attributes(
+    attributes: &AttributeStore,
+    body: &Brep,
+    serial: u64,
+) -> Result<AttributeStore> {
+    let mut store = body_attributes(attributes, body, serial)?;
+    for key in store.attributed_objects() {
+        for h in store.attributes(key) {
+            if store.get(h).is_some_and(|a| !is_application_attribute(a)) {
+                store.remove_attribute(key, h, true)?;
+            }
+        }
+    }
+    store.retain_listed();
+    Ok(store)
+}
+
+/// (not upstream) Replaces, in the session store, the application attributes of the
+/// objects issued `serial` by those `body`'s own store holds (pair of
+/// [`body_application_attributes`], once the operation that carried them succeeded):
+/// the old lists' application entries are dropped (their attributes left without those
+/// users), then `body`'s are seeded and taken from it.
+fn replace_application_attributes(
+    attributes: &mut AttributeStore,
+    body: &mut Brep,
+    serial: u64,
+) -> Result<()> {
+    for key in attributes.attributed_objects() {
+        if crate::topology::brep::p3::topology_entity(serial, key).is_none() {
+            continue;
+        }
+        for h in attributes.attributes(key) {
+            if attributes.get(h).is_some_and(is_application_attribute) {
+                attributes.remove_attribute(key, h, true)?;
+            }
+        }
+    }
+    seed_body_attributes(attributes, body, serial)?;
+    body.take_attributes();
+    Ok(())
+}
+
 /// `~SmFilletExecutive`: `m_pAttributeE` leaves each of its users and is deleted.
 /// (not upstream) Then the bodies get their attributes back from the session store.
 impl Drop for FilletSession<'_> {
@@ -3646,7 +3697,14 @@ impl SolverGeometryAccess<FilletObject> for SessionObjects<'_> {
         use crate::topology::edgeuse::p1 as eu;
         // each solver's rails (the face each rolls on and its curve), its filleted edge
         // (with its ends and curve), and the largest solver tolerance
-        let mut rails: Vec<Vec<(FaceId, crate::curve::curve::Curve)>> = Vec::new();
+        // (and, with the band between the rail's end vertices, its kept interval)
+        let mut rails: Vec<
+            Vec<(
+                FaceId,
+                crate::curve::curve::Curve,
+                crate::geom::extent1d::Extent1d,
+            )>,
+        > = Vec::new();
         let mut edges = Vec::new();
         let mut tol = 0.0;
         for &solver in solvers {
@@ -3670,9 +3728,54 @@ impl SolverGeometryAccess<FilletObject> for SessionObjects<'_> {
                     let curve = crate::topology::edge::curve(self.pseudo.brep(), rail)?
                         .ok_or_else(|| invalid("rail without curve"))?
                         .clone();
-                    if let Some(face) = self.pseudo.fillet_edge(rail)?.original_face() {
-                        own.push((face, curve));
+                    let Some(face) = self.pseudo.fillet_edge(rail)?.original_face() else {
+                        continue;
+                    };
+                    // The rail runs on past its ends (the surfaces are not trimmed yet),
+                    // as far as a mitre at a corner needs and beyond: the band is the
+                    // rail's part between the vertices that end it, where the corners have
+                    // placed them (an end no corner has placed is the rail's own; a rail
+                    // whose ends are one vertex is closed and whole). The fork's
+                    // tangency-labs/smlib@d548305 (WR-649).
+                    let ivl = curve.natural_interval();
+                    let pseudo = self.pseudo.brep();
+                    let prim = eu::primary_edgeuse(pseudo, rail)?
+                        .ok_or_else(|| invalid("rail without primary edgeuse"))?;
+                    let mate = eu::mate(pseudo, prim)?
+                        .ok_or_else(|| invalid("rail edgeuse without mate"))?;
+                    let mut ends = [None; 2];
+                    for (slot, use_) in ends.iter_mut().zip([prim, mate]) {
+                        let vu = eu::vertexuse(pseudo, use_)?
+                            .ok_or_else(|| invalid("rail edgeuse without vertexuse"))?;
+                        *slot = crate::topology::vertexuse::vertex(pseudo, vu)?;
                     }
+                    let [Some(end0), Some(end1)] = ends else {
+                        return Err(invalid("rail end without vertex"));
+                    };
+                    let mut t_ends = [ivl.min(), ivl.max()];
+                    if end0 != end1 {
+                        for (t_end, end) in t_ends.iter_mut().zip([end0, end1]) {
+                            if !self.pseudo.fillet_vertex(end)?.is_processed() {
+                                continue;
+                            }
+                            let at = crate::topology::vertex::point(pseudo, end)?;
+                            let dropped = curve.drop_point(
+                                k,
+                                &ivl,
+                                at,
+                                None,
+                                crate::math::BIG_DOUBLE,
+                                None,
+                                SolverOperation::Minimize,
+                            )?;
+                            if dropped.success {
+                                *t_end = dropped.parameter;
+                            }
+                        }
+                    }
+                    let [t0, t1] = t_ends;
+                    let kept = crate::geom::extent1d::Extent1d::from_min_max(t0, t1);
+                    own.push((face, curve, kept));
                 }
             }
             rails.push(own);
@@ -3706,12 +3809,12 @@ impl SolverGeometryAccess<FilletObject> for SessionObjects<'_> {
                 let (Some(rails_a), Some(rails_b)) = (rails.get(a), rails.get(b)) else {
                     continue;
                 };
-                for (face_a, curve_a) in rails_a {
-                    for (face_b, curve_b) in rails_b {
+                for (face_a, curve_a, kept_a) in rails_a {
+                    for (face_b, curve_b, _) in rails_b {
                         if face_a != face_b {
                             continue;
                         }
-                        let ivl_a = curve_a.natural_interval();
+                        let ivl_a = *kept_a;
                         let ivl_b = curve_b.natural_interval();
                         for s in 1..16_u32 {
                             let p =

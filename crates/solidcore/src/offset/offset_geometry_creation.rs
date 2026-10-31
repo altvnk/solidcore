@@ -136,8 +136,18 @@
 //!   `CreateTrimmedNURBSCurve` gives `NULL` where the port returns an error; any error
 //!   but [`SolidError::Unported`] skips the edge as `NULL` does, as does a failing
 //!   `GlobalSurfaceIntersect`. `SmBrep::ReplaceCurve` is written out in place
-//!   (`brep_replace_curve`, private), with `SmEdge::ClearUVCaches`.
+//!   (`brep_replace_curve`, private), with `SmEdge::ClearUVCaches`. The faces'
+//!   surfaces are intersected through a [`BrepFaceServices`] of the result (the face
+//!   context upstream's `SmSurface::GetFace` gives each surface's trimmed cache), made
+//!   for each edge: the face caches are not kept from one edge to the next, where
+//!   upstream's stay on the surfaces between curve replacements.
 //! - **Recursion.** None.
+//!
+//! With `offset_tangent_gap_statuses` (#483; the fork's behaviour since #2009, fork
+//! 4803d6d), `HaveTangentGaps` skips a sample it cannot evaluate (it measured an unset
+//! point); `ClosestPoint`'s status stays dropped, its success flag decides. A successful
+//! query without a solution retains its existing meaning.
+//!
 
 use crate::blend::fillet_standard_solver::p1::CircularCrossSectionFsg;
 use crate::curve::curve::p1::GlobalPointSolveOptions;
@@ -171,6 +181,7 @@ use crate::nurbs::b_spline_surface::BSplineSurface;
 use crate::nurbs::b_spline_surface_n_lib::p2::{EvaluateFlags, OrientType};
 use crate::nurbs::knots::Side;
 use crate::nurbs::math::{NOW, NOZ};
+use crate::query::brep::BrepFaceServices;
 use crate::query::edge::ClosestPoint;
 use crate::surface::offset_surface::{OffsetSurface, SS_UNKNOWN as OFFSET_SS_UNKNOWN};
 use crate::surface::surface::p1::SurfaceSolveContext;
@@ -183,6 +194,7 @@ use crate::surface::surface_cache::face_context::FaceQueries;
 use crate::surface::surface_cache::SurfaceCache;
 use crate::topology::brep::p1 as bp1;
 use crate::topology::brep::p2 as brep_p2;
+use crate::topology::brep_cache::CacheObject;
 use crate::topology::edge::{self as topo_edge, NotificationStores, NotifyState};
 use crate::topology::edgeuse::p1 as eu1;
 use crate::topology::face::p3::create_uv_trim_curves;
@@ -324,6 +336,37 @@ pub struct ReplaceEdgeCurves {
     pub delete_3d_curve: bool,
     /// `rbDeleteUVCurve`.
     pub delete_uv_curve: bool,
+}
+
+/// Sample the two geometry services in their original order; a no-solution closest
+/// point is a successful query and does not establish a gap.
+fn tangent_gap_samples<B>(
+    k: &Kernel,
+    brep: &mut B,
+    num_samples: u64,
+    tol: f64,
+    mut evaluate: impl FnMut(&Kernel, &mut B, f64) -> Result<Vec3>,
+    mut closest: impl FnMut(&Kernel, &mut B, Vec3) -> Result<Option<f64>>,
+) -> Result<bool> {
+    for i in 0..=num_samples {
+        let param = (i as f64 * 1.0) / (num_samples as f64 * 1.0);
+        let evaluation = ignore_soft(evaluate(k, brep, param))?;
+        let pnt = match evaluation {
+            Some(pnt) => pnt,
+            // fork 4803d6d: a sample that cannot be evaluated shows no gap
+            None if k.fixes.offset_tangent_gap_statuses => continue,
+            None => Vec3::new(UNDEF_DOUBLE, UNDEF_DOUBLE, UNDEF_DOUBLE),
+        };
+        // `ClosestPoint`'s status is dropped (the fork keeps it so: its `bSuccess`
+        // says whether a closest point was found)
+        let cp = ignore_soft(closest(k, brep, pnt))?;
+        if let Some(Some(distance)) = cp {
+            if distance > tol {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 // ---- what the unit needs from the executive and the B-reps --------------------------------
@@ -1348,12 +1391,25 @@ pub fn make_edges_on_analytics_exact(
         if !s1.is_analytic()? || !s2.is_analytic()? {
             continue;
         }
+        // The faces' own surfaces: the SSI reaches each one's cache through its face
+        // (`SmSurface::GetFace`, a trimmed surface cache), so the evaluation copies
+        // (same owner and cache slot) are intersected through the B-rep's face
+        // services, the handles naming the two faces.
+        let s1 = s1.clone_for_evaluation()?;
+        let s2 = s2.clone_for_evaluation()?;
+        let domain1 = s1.natural_uv_domain_with_nurb(k)?;
+        let domain2 = s2.natural_uv_domain_with_nurb(k)?;
         // The surfaces' own intersection: none found (tangent surfaces) leaves the edge.
-        let exact = match s1.global_surface_intersect(
+        let exact = match s1.global_surface_intersect_with_context(
             k,
-            &s1.natural_uv_domain_with_nurb(k)?,
-            s2,
-            &s2.natural_uv_domain_with_nurb(k)?,
+            [
+                Some(CacheObject::Surface(f0)),
+                Some(CacheObject::Surface(f1)),
+            ],
+            &mut BrepFaceServices::new(&mut *b),
+            &domain1,
+            &s2,
+            &domain2,
             use_surface_edges,
             Some(ssi_tol),
             Some(deg20_rad),
@@ -1841,12 +1897,15 @@ impl OffsetGeometryCreation {
                             NurbCircleParam::Quadratic,
                         )?);
                     }
-                    // SetCanonical's status is ignored upstream
-                    let _ = placement.set_canonical(
+                    // SetCanonical's status is ignored upstream (fork 4803d6d: `SER`)
+                    let set = placement.set_canonical(
                         placement.origin(),
                         ref_frame.z_axis(),
                         ref_frame.x_axis(),
                     );
+                    if k.fixes.brep_edit_statuses_pass_on {
+                        set?;
+                    }
                 }
             } // end 1 bounding edge check
 
@@ -2258,13 +2317,19 @@ impl OffsetGeometryCreation {
                 let c = brep
                     .curve_mut(c3)
                     .ok_or(dangling("curve handle cannot be resolved"))?;
-                let _ = ignore_soft(c.reverse_parameterization(k, &ivl))?;
+                let _ = ignore_soft(crate::error::passed_on(
+                    c.reverse_parameterization(k, &ivl),
+                    k.fixes.brep_edit_statuses_pass_on,
+                )?)?;
                 let uv = uv_curve.ok_or(dangling("null UV curve reversed"))?;
                 let ivl = curve_of(brep, uv)?.natural_interval();
                 let c = brep
                     .curve_mut(uv)
                     .ok_or(dangling("curve handle cannot be resolved"))?;
-                let _ = ignore_soft(c.reverse_parameterization(k, &ivl))?;
+                let _ = ignore_soft(crate::error::passed_on(
+                    c.reverse_parameterization(k, &ivl),
+                    k.fixes.brep_edit_statuses_pass_on,
+                )?)?;
             } // end Edge and Input curve running in opposite directions check
 
             // set input curves as Edge geometry (deleting the pre-existing curve and the
@@ -2663,20 +2728,20 @@ impl OffsetGeometryCreation {
                     // (neither status is checked upstream: a failed evaluation leaves its
                     // output at SmPoint3d's SM_UNDEF_DOUBLE default)
                     let undef = Vec3::new(UNDEF_DOUBLE, UNDEF_DOUBLE, UNDEF_DOUBLE);
-                    let pv = ignore_soft(curve_of(brep, curve_3d)?.evaluate(
-                        k,
-                        sol.start.param(0)?,
-                        1,
-                        true,
-                        true,
-                    ))?;
+                    let pv = ignore_soft(crate::error::passed_on(
+                        curve_of(brep, curve_3d)?.evaluate(k, sol.start.param(0)?, 1, true, true),
+                        k.fixes.brep_edit_statuses_pass_on,
+                    )?)?;
                     let uv = Point2::new(sol.start.param(1)?, sol.start.param(2)?);
-                    let normal = ignore_soft(surface_of(brep, ext_surface)?.evaluate_normal(
-                        k,
-                        uv,
-                        Side::Left,
-                        Side::Left,
-                    ))?
+                    let normal = ignore_soft(crate::error::passed_on(
+                        surface_of(brep, ext_surface)?.evaluate_normal(
+                            k,
+                            uv,
+                            Side::Left,
+                            Side::Left,
+                        ),
+                        k.fixes.brep_edit_statuses_pass_on,
+                    )?)?
                     .unwrap_or(undef);
                     let tangent = pv
                         .and_then(|pv| pv.get(1).copied())
@@ -3694,9 +3759,11 @@ impl OffsetGeometryCreation {
     ///
     /// # Errors
     ///
-    /// Those of the closest point (`SmEdgeuse::NormalizedEvaluate`'s status is ignored,
-    /// [`SolidError::Unported`] aside); [`SolidError::InvalidInput`]
-    /// for an edge use without edge.
+    /// Evaluation and closest-point statuses are ignored (`Unported` aside); with
+    /// `offset_tangent_gap_statuses` a sample that cannot be evaluated is skipped
+    /// (fork 4803d6d). A successful closest-point query without a solution does not
+    /// establish a gap.
+    /// [`SolidError::InvalidInput`] for an edge use without edge.
     pub fn have_tangent_gaps<O: ClassObject + SolutionObject>(
         &self,
         k: &Kernel,
@@ -3710,28 +3777,19 @@ impl OffsetGeometryCreation {
             .ok_or(dangling("edge use without edge"))?;
         let tol = brep.edge_tolerance(edge)?;
 
-        for i in 0..=num_samples {
-            let param = (i as f64 * 1.0) / (num_samples as f64 * 1.0);
-            // (the evaluation's status is not checked upstream: a failed evaluation leaves
-            // sPnt at SmPoint3d's SM_UNDEF_DOUBLE default)
-            let pnt = ignore_soft(edgeuse_normalized_evaluate(
-                k,
-                brep,
-                other_offset_edgeuse,
-                param,
-                false,
-                false,
-                true,
-            ))? // FALSE = 3d Eval
-            .unwrap_or(Vec3::new(UNDEF_DOUBLE, UNDEF_DOUBLE, UNDEF_DOUBLE));
-            // (ClosestPoint's status is not checked either; only bSuccess && d > tol is)
-            if let Some(Some(cp)) = ignore_soft(brep.edge_closest_point(k, edge, pnt))? {
-                if cp.distance > tol {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        tangent_gap_samples(
+            k,
+            brep,
+            num_samples,
+            tol,
+            |k, b, t| {
+                edgeuse_normalized_evaluate(k, b, other_offset_edgeuse, t, false, false, true)
+            },
+            |k, b, p| {
+                b.edge_closest_point(k, edge, p)
+                    .map(|cp| cp.map(|cp| cp.distance))
+            },
+        )
     }
 
     /// Not upstream (`IsStepAcrossEdge`, fork tangency-labs/smlib 5d428ae, opt-in
@@ -4334,8 +4392,14 @@ impl OffsetGeometryCreation {
             if dropped.success {
                 // Trim CenterLine to Start dropPoint (both statuses ignored; the trim may
                 // snap sCenterIvl by tol to existing knots)
-                let _ = ignore_soft(center_ivl.set_min_max(dropped.parameter, center_ivl.max()))?;
-                let _ = ignore_soft(center_line.trim(k, &mut center_ivl, TrimMode::Notify))?;
+                let _ = ignore_soft(crate::error::passed_on(
+                    center_ivl.set_min_max(dropped.parameter, center_ivl.max()),
+                    k.fixes.brep_edit_statuses_pass_on,
+                )?)?;
+                let _ = ignore_soft(crate::error::passed_on(
+                    center_line.trim(k, &mut center_ivl, TrimMode::Notify),
+                    k.fixes.brep_edit_statuses_pass_on,
+                )?)?;
             }
         } // end Rail1/CenterLine StartPoint gapSize check
 
@@ -4365,8 +4429,14 @@ impl OffsetGeometryCreation {
             // when Rail1Curve EndPoint dropped to CenterLine
             if dropped.success {
                 // Trim CenterLine to End dropPoint
-                let _ = ignore_soft(center_ivl.set_min_max(center_ivl.min(), dropped.parameter))?;
-                let _ = ignore_soft(center_line.trim(k, &mut center_ivl, TrimMode::Notify))?;
+                let _ = ignore_soft(crate::error::passed_on(
+                    center_ivl.set_min_max(center_ivl.min(), dropped.parameter),
+                    k.fixes.brep_edit_statuses_pass_on,
+                )?)?;
+                let _ = ignore_soft(crate::error::passed_on(
+                    center_line.trim(k, &mut center_ivl, TrimMode::Notify),
+                    k.fixes.brep_edit_statuses_pass_on,
+                )?)?;
             }
         } // end Rail1/CenterLine EndPoint gapSize check
 
@@ -4688,7 +4758,10 @@ impl<O: ClassObject + SolutionObject> LocalOperationGeometryCreation<O> {
                 let s = brep
                     .surface_mut(new_surface)
                     .ok_or(dangling("surface handle cannot be resolved"))?;
-                let _ = ignore_soft(s.reparameterize(k, &old_domain))?;
+                let _ = ignore_soft(crate::error::passed_on(
+                    s.reparameterize(k, &old_domain),
+                    k.fixes.brep_edit_statuses_pass_on,
+                )?)?;
             }
             // Copy pS, when possible as an analytic surface (the listed surface is deleted)
             let mut analytic = surface_of(brep, new_surface)?.copy_and_add_analytics(k)?;
@@ -4706,6 +4779,102 @@ impl<O: ClassObject + SolutionObject> LocalOperationGeometryCreation<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_483_tangent_gaps_preserve_errors_and_no_solution() {
+        let mut k = Kernel::default();
+        let error = SolidError::sm_err("injected tangent-gap service");
+        for checked in [false, true] {
+            k.fixes.offset_tangent_gap_statuses = checked;
+            for fail_evaluation in [false, true] {
+                let mut calls = Vec::new();
+                let result = tangent_gap_samples(
+                    &k,
+                    &mut calls,
+                    2,
+                    1e-6,
+                    |_, calls, _| {
+                        calls.push("evaluate");
+                        if fail_evaluation {
+                            Err(error.clone())
+                        } else {
+                            Ok(Vec3::ZERO)
+                        }
+                    },
+                    |_, calls, _| {
+                        calls.push("closest");
+                        Err(error.clone())
+                    },
+                );
+                if checked {
+                    // fork 4803d6d: a failed sample is skipped; ClosestPoint's status
+                    // stays dropped
+                    assert!(!result.unwrap());
+                    assert_eq!(
+                        calls,
+                        if fail_evaluation {
+                            vec!["evaluate"; 3]
+                        } else {
+                            ["evaluate", "closest"].repeat(3)
+                        }
+                    );
+                } else {
+                    assert!(!result.unwrap());
+                    assert_eq!(calls.len(), 6);
+                }
+            }
+            let mut samples = Vec::new();
+            assert!(!tangent_gap_samples(
+                &k,
+                &mut samples,
+                2,
+                1e-6,
+                |_, calls, t| {
+                    calls.push(t);
+                    Ok(Vec3::X * t)
+                },
+                |_, _, _| Ok(None)
+            )
+            .unwrap());
+            assert_eq!(samples, vec![0.0, 0.5, 1.0]);
+            assert!(tangent_gap_samples(
+                &k,
+                &mut (),
+                2,
+                1e-6,
+                |_, (), _| Ok(Vec3::X),
+                |_, (), _| Ok(Some(2e-6))
+            )
+            .unwrap());
+        }
+    }
+
+    /// fork 4803d6d (`SmOffsetGeometryCreation::HaveTangentGaps`): a sample that
+    /// cannot be evaluated shows no gap. Upstream measures the unset point instead, and
+    /// a closest point far from it reads as a gap.
+    #[test]
+    fn tangent_gaps_skip_a_sample_that_cannot_be_evaluated() {
+        for skip in [false, true] {
+            let mut k = Kernel::default();
+            k.fixes.offset_tangent_gap_statuses = skip;
+            let gap = tangent_gap_samples(
+                &k,
+                &mut (),
+                2,
+                1e-6,
+                |_, (), t| {
+                    if t == 0.5 {
+                        Err(SolidError::sm_err("injected evaluation failure"))
+                    } else {
+                        Ok(Vec3::X * t)
+                    }
+                },
+                |_, (), p| Ok(Some(if p.x == UNDEF_DOUBLE { 1.0 } else { 0.0 })),
+            )
+            .unwrap();
+            assert_eq!(gap, !skip);
+        }
+    }
 
     #[test]
     fn creation_defaults() {
