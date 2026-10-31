@@ -523,6 +523,17 @@ pub struct UpstreamFixes {
     pub fillet_removal_takes_ring_fillets: bool,
     /// `SmMerge::ManifoldBoolean` refuses a union (`SM_ERR`, the face in the error) when a face its STEP 6 would delete has the infinite region on one side and a solid region on the other: deleting it would merge that solid into the outside. Upstream deletes it: where two operands' faces stay within tolerance of each other across a strip without being coincident (two 4 mm cubes, one turned 5.7 deg about z, within 5e-6 across a 1e-4 strip), the union deletes two such faces of the first operand, both of its solid regions merge into the infinite region, and the union comes back with no solid region and volume 0 (WR-619, #1794; own design, not in the fork).
     pub boolean_union_refuses_solid_leak: bool,
+    /// `SmOffsetSurface::EvaluatePlainOrSimple` uses the correct coefficients and base
+    /// derivatives in its four third-order terms: `Cuuv`'s `Buuv x Buv` coefficient is
+    /// `1` (the derivative of `Cuu`, not `3`), `Cuvv`'s `Buvv x Buv` coefficient is
+    /// `-1` (the derivative of `Cvv`, not `3`), and `Duvv` / `Dvvv` add `Buvv` / `Bvvv`
+    /// (not `Buuv`), so `Duuv`, `Duvv` and `Dvvv` agree with the closed-form derivatives
+    /// of the offset (WR-160 and WR-161; PR #1914). Orders 0..2 and `Duuu` are
+    /// unchanged. Off by default for pinned C++ parity. `WR-162` (the upper-half,
+    /// unequal-order second-derivative slot write) is still unfixed. An in-kernel
+    /// `CrvOnSurf` evaluator that reads these third partials can consume the corrected
+    /// values, but no production case that does was measured.
+    pub offset_surface_third_derivative_terms: bool,
 }
 
 /// Options for [`Kernel::new`].
