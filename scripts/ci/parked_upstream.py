@@ -15,8 +15,9 @@ in the next (issue #1405 had five such parked sweep cases advertised as agreemen
 although nothing had changed). For units with ND-* cases the workflow reruns C++ with
 the pads below and `difftest` records per-case `heap_qualification`. An ND-* pass is
 eligible only with complete evidence for the same unit and case, every pad observed
-on a really padded forked child, and no divergence. Non-ND units keep their original
-single-run path; non-ND defects keep the plain `pass` rule.
+on a really padded forked child, and no divergence. Every report must identify the
+requested unit. Non-ND units keep their original single-run path; valid non-ND reports
+keep the plain `pass` rule.
 
   parked_upstream.py units [--root DIR]
       the unit ids with at least one parked case, one per line
@@ -78,8 +79,11 @@ def heap_qualified(report, case):
         or any(type(pad) is not int for pad in q["pads"])
     ):
         return False
+    observations = q.get("cases")
+    if not isinstance(observations, list):
+        return False
     entries = [
-        o for o in q.get("cases") or () if isinstance(o, dict) and o.get("case") == case
+        o for o in observations if isinstance(o, dict) and o.get("case") == case
     ]
     if len(entries) != 1:
         return False
@@ -97,9 +101,9 @@ def agreeing(report_dir, parked):
     """[(unit, case, id)] adoptable parked cases and the units without a report.
 
     A case is adoptable when its `--run-parked` outcome is `pass` and, for an `ND-*`
-    defect, its report carries complete heap qualification. Passing `ND-*` cases that
-    are not qualified are returned separately: they may be address-dependent, so they
-    must not be advertised as agreement.
+    defect, its report carries complete heap qualification. Passing cases without
+    matching report identity or the required heap qualification are returned separately
+    and must not be advertised as agreement.
     """
     found, missing, unqualified = [], [], []
     for unit, cases in sorted(parked.items()):
@@ -112,8 +116,9 @@ def agreeing(report_dir, parked):
             if c.get("outcome") != "pass" or c.get("name") not in cases:
                 continue
             defect = cases[c["name"]]
-            if defect.startswith(HEAP_DEPENDENT_PREFIX) and (
-                report.get("unit") != unit or not heap_qualified(report, c["name"])
+            if report.get("unit") != unit or (
+                defect.startswith(HEAP_DEPENDENT_PREFIX)
+                and not heap_qualified(report, c["name"])
             ):
                 unqualified.append((unit, c["name"], defect))
                 continue
@@ -154,16 +159,17 @@ def body(found, parked, unqualified, ref, sha):
         ]
     elif unqualified:
         lines.append(
-            "Nothing is adoptable yet: the case(s) below passed but are not fully "
-            "heap-qualified."
+            "Nothing is adoptable yet: the case(s) below passed but lack matching "
+            "report identity or required heap qualification."
         )
     else:
         lines.append("None of them agrees with Rust yet: nothing to adopt.")
     if unqualified:
         lines += [
             "",
-            "Passed once, not adopted (`ND-*` heap qualification incomplete: the C++ "
-            "result may depend on memory addresses, so one passing run proves nothing): "
+            "Passed once, not adopted (report identity mismatch or `ND-*` heap "
+            "qualification incomplete; this is not agreement evidence for the same "
+            "unit and case): "
             + ", ".join(f"`{u}`/`{c}` ({i})" for u, c, i in unqualified)
             + ".",
         ]

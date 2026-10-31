@@ -132,6 +132,12 @@ class ParkedUpstreamTest(unittest.TestCase):
             "boolean pad": qualified(case, pads=(True,) + p.REQUIRED_PADS[1:]),
             "observation for another case": qualified("other"),
             "no observation": {"pads": list(p.REQUIRED_PADS), "cases": []},
+            "integer observations": {"pads": list(p.REQUIRED_PADS), "cases": 5},
+            "boolean observations": {"pads": list(p.REQUIRED_PADS), "cases": True},
+            "float observations": {"pads": list(p.REQUIRED_PADS), "cases": 2.5},
+            "null observations": {"pads": list(p.REQUIRED_PADS), "cases": None},
+            "object observations": {"pads": list(p.REQUIRED_PADS), "cases": {}},
+            "string observations": {"pads": list(p.REQUIRED_PADS), "cases": "parked"},
             "block not an object": [list(p.REQUIRED_PADS)],
         }
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as out:
@@ -148,6 +154,36 @@ class ParkedUpstreamTest(unittest.TestCase):
                         reports, p.parked_cases(Path(root)))
                     self.assertEqual(found, [], why)
                     self.assertEqual(unqualified, [("a.b", case, "ND-1")], why)
+
+    def test_non_nd_pass_requires_matching_report_unit(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as out:
+            write(root, p.KNOWN_DIR + "/c.d.toml", PARKED_OTHER)
+            reports = Path(out) / "reports"
+            parked = p.parked_cases(Path(root))
+            for report_unit in ("other.unit", None):
+                report = {"cases": [{"name": "plain", "outcome": "pass"}]}
+                if report_unit is not None:
+                    report["unit"] = report_unit
+                write(reports, "c.d.json", json.dumps(report))
+                with self.subTest(report_unit=report_unit):
+                    self.assertEqual(
+                        p.agreeing(reports, parked),
+                        ([], [], [("c.d", "plain", "UB-2")]))
+                    self.assertEqual(
+                        self.run_main(*self.issue_args(root, reports, out))[0], 0)
+                    self.assertNotIn(
+                        ("c.d", "plain", "UB-2"),
+                        adoption_rows((Path(out) / "body").read_text()))
+
+            # Correctly identified non-ND passes still need no heap qualification.
+            write(reports, "c.d.json", json.dumps(
+                {"unit": "c.d", "cases": [{"name": "plain", "outcome": "pass"}]}))
+            self.assertEqual(
+                p.agreeing(reports, parked), ([("c.d", "plain", "UB-2")], [], []))
+            self.assertEqual(self.run_main(*self.issue_args(root, reports, out))[0], 0)
+            self.assertIn(
+                ("c.d", "plain", "UB-2"),
+                adoption_rows((Path(out) / "body").read_text()))
 
     def test_report_with_nothing_selected_adopts_nothing_without_error(self):
         # `--run-parked` on a libc where the parked entry does not apply (the glibc-only
