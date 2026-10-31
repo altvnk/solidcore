@@ -322,7 +322,16 @@ impl FilletSession<'_> {
             }
             self.noted(note.take(), cut)?;
         }
-        let blended = Blended::of_edges(self.objects.target, &blended_edges)?;
+        let mut blended = Blended::of_edges(self.objects.target, &blended_edges)?;
+        // the filleted edge of each fillet face of the sheet (WR-636, `bba9914`), read
+        // after the cuts, which can replace a geometry's face
+        for (&solver, &edge) in solvers.iter().zip(&blended_edges) {
+            for &(_, f) in faces_of.get(&solver).map_or(&[][..], Vec::as_slice) {
+                if let Some(f) = f {
+                    blended.edge_of_fillet.insert(f, edge);
+                }
+            }
+        }
         let closed = close_removal_region(
             k,
             &mut region,
@@ -380,9 +389,27 @@ impl FilletSession<'_> {
         // the region from the target, by the Boolean (the merge modifies the target in
         // place; the region is deleted after)
         let kept = (*self.objects.target).clone();
+        let target_solid = crate::topology::brep::p2::is_manifold_solid(&kept)?;
         let taken: Brep = std::mem::take(&mut *self.objects.target);
         match boolean(k, taken, region, BooleanOperation::Difference) {
             Ok(outcome) => {
+                // Not the fork's (WR-631 addendum): the subtraction from a manifold solid
+                // must leave one. The Boolean can succeed with an empty or open body (a
+                // region whose face meets a target face a hair from its edge, #1467's box
+                // at r10.02); the fork checks only the Boolean's status. Refused here as
+                // no room, the target as it was.
+                if target_solid
+                    && (outcome.result.faces().ids().next().is_none()
+                        || !crate::topology::brep::p2::is_manifold_solid(&outcome.result)?)
+                {
+                    *self.objects.target = kept;
+                    self.note_refusal(Refusal {
+                        code: FilletErrorType::NoRoom,
+                        reason: Some(NoRoomReason::CliffSubtractionLeavesNoSolid),
+                        comment: "Fillet Error: subtracting a cliff overflow's removal region leaves no solid",
+                    });
+                    return Err(SolidError::sm_err(OP));
+                }
                 *self.objects.target = outcome.result;
                 Ok(())
             }
