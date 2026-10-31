@@ -263,6 +263,8 @@ pub struct UpstreamFixes {
     pub flat_corners_test_bits: bool,
     /// `sm_GoodDropResult` (`SmSurface::DropPoint` given a guess) refuses a local solve's result when the result is farther from the point than its guess, as its comment says; upstream measures its two distances the wrong way round (`dDsqGuess` to the result, `dDsqResult` to the guess), so it refused a result nearer than its guess, sending the drop to the global solve, and took one farther (WR-56, #1852; the fork's tangency-labs/smlib@0b4de8c, fork PR #70, not yet merged in the fork's main).
     pub good_drop_result_distances_in_order: bool,
+    /// `SmSurface::DropCurve` tests the drop domain's own V length for `bDegenSurfV`, not the U length again, so a surface whose natural domain is degenerate only in V reports `SM_ERR_DEGENERATE_SURFACE` (`SM_CTC_DEGENSURFACE_FAIL`) and its failure record sets `bDegenSurfV` from V; upstream copies the U test, misses the early exit and goes on to drop (WR-100, 2026-10-31 addendum). Off by default for pinned C++ parity.
+    pub drop_curve_v_domain_degeneracy: bool,
     /// `SmTorus::AssertValid` tests its V (minor) interval, not the U interval twice, and reports its U and V overlap tests as 3 and 4 (and `SmSurfOfRevolution`'s U test as 13), the ids their labels give them, where upstream reports them as 2 and 3 (and 2) (WR-538, #482; the fork's tangency-labs/smlib@0cd9d08).
     pub torus_check_reads_v_interval: bool,
     /// `SmTorus::AssertValid` reports a spindle torus whose V interval runs through an apex (`V = ±(90 + asin(R/r))`) as test 5, "Self Intersection", where upstream clears its result with no report and tests the U interval against `90 + acos(R/r)`, failing every spindle torus with a whole turn of U (WR-539; the fork's tangency-labs/smlib@daba678).
@@ -305,6 +307,12 @@ pub struct UpstreamFixes {
     pub revolve_splits_curves_on_axis: bool,
     /// `SmTrimmingTools::OrderCurvesIntoLoops`, at a vertex where several curve ends meet (a hole whose corner touches the outline), goes on from the end (of a curve it has not used, or its first curve's start) whose leaving tangent comes next round the vertex from the arriving curve's, about the plane those tangents span (ends leaving tangent to each other in the order they bend). Upstream takes the first such end by index in the input, so the input order decides whether the loop closes, ends on a curve it already used (`SM_ERR`) or runs round the hole the wrong way, crossing itself and counting the hole as material (WR-591; the fork's tangency-labs/smlib@9209e76).
     pub loops_go_on_round_the_vertex: bool,
+    /// `SmTrimmingTools::MirrorCurve` keeps the Euclidean control points `GetCanonical`
+    /// returns instead of dividing each one by its weight a second time, so a rational UV
+    /// curve is reflected rather than moved and distorted (WR-98; see
+    /// `plan/upstream-issues/WR-98--addendum-2026-10-31-euclidean-mirror.md`). Off by
+    /// default: the pinned C++ divides twice.
+    pub mirror_curve_keeps_euclidean_control_points: bool,
     /// A curve sweep caps from the side faces at the sweep's start and end (WR-404, #411).
     pub curve_sweep_caps_at_sweep_ends: bool,
     /// `CreateLinearSweep` makes a circular arc short of a whole turn that is swept square to its plane an `SmCylinder` bounded 0..its sweep angle by 0..the distance, its frame turned to the arc's start (for a sweep against the arc's normal, to its end and then flipped), where upstream makes a cylinder only of a whole circle and an `SmSurfOfExtrusion` of any other arc; a sweep that is not square stays a surface of extrusion (WR-565, #1477; SolidCraft change, tangency-labs/smlib 12918e9).
