@@ -842,9 +842,11 @@ pub fn run_unit(unit: &dyn UnitDiff, ctx: &CaseContext, opts: &RunOptions) -> Un
                     res.heap_check.padded += usize::from(padded > 0);
                     let name = case.name.clone();
                     let divergence = match &flag {
-                        Some(HeapFlag::AddressDependent(n))
-                        | Some(HeapFlag::Unstable(n))
-                        | Some(HeapFlag::RerunError(n)) => Some(n.clone()),
+                        Some(
+                            HeapFlag::AddressDependent(n)
+                            | HeapFlag::Unstable(n)
+                            | HeapFlag::RerunError(n),
+                        ) => Some(n.clone()),
                         None => None,
                     };
                     res.heap_check.observations.push(HeapObservation {
