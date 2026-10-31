@@ -145,6 +145,9 @@ impl Caches {
 #[allow(clippy::struct_excessive_bools)]
 #[non_exhaustive]
 pub struct UpstreamFixes {
+    /// `SmCurveLoops::GetLoopStartEnd` starts a later loop after the previous loop
+    /// ends, keeping adjacency within that loop (WR-96). Off by default for C++ parity.
+    pub curve_loop_start_after_previous_end: bool,
     /// The generic temporary-radius constructor reports setup failures before filleting (#458, UB-252 follow-up).
     pub temporary_radius_setup_errors: bool,
     /// `SmFilletGeom::Trim` returns the first curve/surface trim or interval-intersection error instead of dropping it and continuing with an unset interval (WR-604, #483). Earlier successful edits remain; off by default for pinned C++ parity.
@@ -232,6 +235,14 @@ pub struct UpstreamFixes {
     pub check_loop_vertex_tolerance: bool,
     /// `CheckLoop` compares an end projected from its vertex (no UV trim) with its neighbour on the nearest natural period of a closed direction, so a one-period seam jump is not an `SM_ERR` (WR-440, #530).
     pub check_loop_projected_seam_ends: bool,
+    /// `SmLoopuse::IsClosed3d` reports a loop open when an end-to-end gap exceeds its
+    /// cross-section tolerance: the over-tolerance value is `gap - tolerance`, where the
+    /// pinned C++ computes `tolerance - gap` (never above its zero initial maximum, so
+    /// it always reports closed). The reported gap is the actual gap, with its edge use
+    /// and tolerance; `bCheckAllGaps == FALSE` still stops at the first over-tolerance
+    /// gap (WR-93). Off by default for pinned C++ parity; callers inherit the kernel's
+    /// setting.
+    pub loop_use_reports_open_gaps: bool,
     /// `SmEdge::AssertValid` test 9 orders the faces round an edge by the direction to each face's point 20 edge tolerances into it (square to the edge) where two of them leave the edge within `SM_ANG_TOL_DEG` of each other, instead of by the binormals alone, which tie for faces tangent along the edge (a cylinder resting on a plane, kept by a boolean as a four-face edge) and fail the valid order (WR-540, #383; the fork's tangency-labs/smlib@5533bbb).
     pub edge_check_orders_tangent_faces: bool,
     /// `CreateOrientedTrimBoundary` takes a UV gap of whole periods (up to 1% of one) in a closed direction between consecutive curves for a seam crossing and moves the curves after it by the period, instead of filling it with a line across the whole domain that doubles the loop back on itself (WR-491). A loop that does not close that way keeps the line, and so does a gap along a singular side of the surface (a sphere's pole, a cone's apex; #1437).
@@ -264,6 +275,16 @@ pub struct UpstreamFixes {
     pub nurb_cylinder_inside_out_frame: bool,
     /// `SweepProfilesAlongPath` asks for caps only when the profile closes (WR-400, #837).
     pub planar_path_uncapped_open_profiles: bool,
+    /// `PositionProfileCurves` returns the first failing status of its two
+    /// `SmAxis2Placement::SetCanonical` calls, its three profile `Transform` calls and
+    /// `MakeUnitOrthoVectors`, instead of ignoring them and positioning the profiles
+    /// with the partial frame: a path start tangent whose squared length overflows
+    /// (a `1e300` component) unitizes to zero, `MakeUnitOrthoVectors` fails `SM_ERR`,
+    /// and upstream then transforms the profiles by an invalid partial frame (WR-632,
+    /// #483). The edits made before the first failure stay (no rollback); the identity
+    /// `SetCanonical` on the profile-normal frame (always successful upstream) is
+    /// elided. Off by default for pinned C++ parity.
+    pub planar_path_profile_placement_statuses: bool,
     /// A rotational sweep (whole or partial turn) makes each line and circular arc of its profile its cylinder, cone, sphere or torus, not only a one-curve profile's (WR-448, #545; SolidCraft change, tangency-labs/smlib 0b143f7).
     pub revolve_analytic_profile_faces: bool,
     /// With `revolve_analytic_profile_faces`, a revolved arc whose centre is within the B-rep tolerance of the axis is the sphere centred on the axis through the arc's ends, and an end within it of the axis is its pole, not a sphere (or torus) built on the arc's own off-axis circle with a pole row of radius about sqrt(2 tol R) (WR-471, #1123; tangency-labs/smlib, "a revolved arc centred within tolerance of the axis is a sphere through its ends").
@@ -434,6 +455,8 @@ pub struct UpstreamFixes {
     pub brep_area_between_solid_and_void: bool,
     /// An offset surface evaluated beyond its base's domain extends the base itself on every side that can grow at once, each by the domain size times the least power of two that reaches the point and never less than the extension it replaces, so two copies of one offset give the same points whatever was evaluated first (WR-458, #419; the fork's tangency-labs/smlib@2d7c7ed).
     pub offset_extension_from_base: bool,
+    /// With `offset_extension_from_base` (which must be on too; this flag does nothing without it), an offset surface whose base is a cylinder, cone, sphere or torus extends that base past its domain as itself (each end span's rational arc or straight line carried on, piece by piece, NLib's C-infinity extension), where upstream's tangent ruled extension (G1R) leaves the surface at once: a cylinder R25 continued 0.44 past its face's end was 0.0036 off the circle, and a round traced there was built that far off all along (WR-633, #960; the SolidCraft fork's tangency-labs/smlib@de0a6b8, branch `replay/1.0.1`).
+    pub offset_extension_as_itself: bool,
     /// `N_FillNSidedHole` (through `SmBSplineSurface::CreateCornerBlend`) shortens the cross-boundary derivative across an inner curve where its cubic blend from the opposite boundary would leave that boundary's tangent plane, so a corner patch (a fillet setback corner) stays inside planar faces it meets, with G1 kept (WR-461, #1170). Curved neighbours are not covered.
     pub corner_blend_stays_inside_neighbours: bool,
     /// `DoFilleting`'s `BooleanPostProcess` removes none of the target's own edges, nor an edge between two of its faces (the fork's `m_sPostProcessKeptEdges`/`Faces`), so the patches of a sphere imported in six faces are not merged into a face no patch's parameterization can carry (WR-459, #423; the fork's tangency-labs/smlib@9ddf4a8).
@@ -454,6 +477,8 @@ pub struct UpstreamFixes {
     pub fillet_3x2_mixed_concave_side_edge: bool,
     /// With `fillet_3x2_mixed_concave_side_edge` (which must be on too), `SmFillet3x2MixedConvexityCorner::MakeCornerTopology` takes the two fillets' roles at an unfilleted edge whose faces meet tangentially at the vertex (a block's side running tangent into a cylinder whose wall the block's top meets) from the faces' corners, not from `IsConvexRadialSector`, which on a G1 edge reads only the sign of rounding: the convex fillet's rail crosses that edge unless its face shared with the edge turns more than half a turn between them at the vertex (`sm_CheckFaceComplimentaryCornerConcavity`), so the concave round's rail is no longer sent to cross an edge it never meets and the corner no longer fails with status 1001 (fillet error 3, corner type 5) (WR-597; the fork's tangency-labs/smlib@c17b745).
     pub fillet_3x2_tangent_side_edge_roles: bool,
+    /// `SmFilletNx2Corner::MakeCornerTopology` mitres two blends meeting at a vertex of three edges where the common face's corner between them is concave (mixed convexity: a pocket's rim at its sharp corner, a boss's root at its sharp corner, the side edge not filleted), as at a corner of uniform convexity: the rails meet in the common face (`SM_FV_RAIL_X_RAIL`) and on the side edge, the blends' surfaces meet along their intersection, and the corner is a bevel (where the rails meet the side edge at two places, `AdjustTopology` joins them along the side face). Upstream sweeps a 3-sided face round the side edge between ribs straight across from where the rails meet it. Edges meeting at 5 degrees or less still blend (WR-642; the fork's tangency-labs/smlib@4f06e72, the owner's ruling of 2026-10-30).
+    pub fillet_mitre_concave_face_corners: bool,
     /// `TrimExtendedEdge` takes, on a closed curve, the arc that runs where its base edge does, not always the interval between its two trim points: a hemisphere's rim, two arcs of one circle, no longer becomes one arc twice (WR-463, #403; the fork's tangency-labs/smlib@fa7ff4a).
     pub offset_closed_curve_trim_arc: bool,
     /// `MateEdges` also intersects analytic copies of the two faces' surfaces (plane, cylinder, cone, sphere, torus; extended only along a plane or a cylinder's or cone's rulings, where the tangent (G1R) extensions still are the surface) and replaces each marched piece that lies on an exact line or conic between the same ends, and drops to one UV curve on each extended surface within the body's tolerance, by that exact curve, so a shelled cylinder's floor circle, seam line and rim stay exact (WR-495, #1453/#1130; the fork's tangency-labs/smlib@fddc366 and @98ab1b0).
